@@ -85,6 +85,7 @@ def detect_events_for_stations(station_ids: List[str],
                                 threshold_db: float = 10.0,
                                 window_hours: int = 3) -> Dict[str, List[Dict]]:
     from data_models import get_station_measurements
+    from time_analysis import _infer_event_source
 
     all_events = {}
     for sid in station_ids:
@@ -96,6 +97,9 @@ def detect_events_for_stations(station_ids: List[str],
         for e in events:
             e['station_id'] = sid
             e['_spectrum_vec'] = get_event_spectrum_vector(e, m_df)
+            if 'source_name' not in e or 'icon' not in e:
+                source_info = _infer_event_source(e, m_df)
+                e.update(source_info)
         all_events[sid] = events
     return all_events
 
