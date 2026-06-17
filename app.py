@@ -34,7 +34,7 @@ from zone_analysis import (
 from time_analysis import get_station_time_analysis, calculate_hourly_pattern, detect_noise_events, get_event_statistics
 from spectrum_analysis import get_station_source_analysis, generate_source_recommendations
 from noise_prediction import predict_road_traffic_noise, generate_prediction_contour
-from report_generator import generate_report_pdf
+from report_generator import generate_report_pdf, generate_comparison_report_pdf
 from correlation_analysis import (
     compute_station_distance_matrix, detect_events_for_stations,
     match_cooperative_events, estimate_source_location,
@@ -81,7 +81,9 @@ def init_session_state():
         'coop_spectrum_threshold': 0.7,
         'coop_time_tolerance': 2.0,
         'coop_result': None,
-        'coop_locations': None
+        'coop_locations': None,
+        'coop_compare_groups': [],
+        'coop_selected_group': None
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -2217,13 +2219,43 @@ def page_cooperative_tracing():
         if groups_sorted:
             import plotly.graph_objects as go
             
-            t_min = groups_sorted[0]['earliest_time'] - timedelta(minutes=30)
-            t_max = groups_sorted[-1]['latest_time'] + timedelta(minutes=30)
-            t0 = t_min
-            
             group_colors_list = ['#E53935', '#D81B60', '#8E24AA', '#5E35B1',
                             '#3949AB', '#1E88E5', '#00ACC1', '#00897B']
             two_station_color = '#FF9800'
+            
+            group_color_map = {}
+            for gi, group in enumerate(groups_sorted):
+                gid = group['group_id']
+                num_stations = len(group['participating_stations'])
+                color_hex = group_colors_list[gi % len(group_colors_list)] if num_stations >= 3 else two_station_color
+                group_color_map[gid] = color_hex
+            
+            gid_options = [g['group_id'] for g in groups_sorted]
+            
+            compare_options = gid_options
+            compare_default = [g for g in st.session_state.coop_compare_groups if g in compare_options]
+            
+            st.markdown("##### 📊 多组对比分析 - 选择事件组（2-5个）")
+            col_compare1, col_compare2 = st.columns([3, 1])
+            with col_compare1:
+                compare_selected = st.multiselect(
+                    "选择要对比的事件组",
+                    options=compare_options,
+                    default=compare_default,
+                    format_func=lambda x: f"{x} ({next((len(g['participating_stations']) for g in groups_sorted if g['group_id'] == x), 0)}站, {next((g['avg_peak_leq'] for g in groups_sorted if g['group_id'] == x), 0):.1f}dB)",
+                    key="coop_compare_selector",
+                    max_selections=5
+                )
+            with col_compare2:
+                if st.button("🔄 重置选择", key="coop_compare_reset"):
+                    st.session_state.coop_compare_groups = []
+                    st.rerun()
+            
+            st.session_state.coop_compare_groups = compare_selected
+            
+            t_min = groups_sorted[0]['earliest_time'] - timedelta(minutes=30)
+            t_max = groups_sorted[-1]['latest_time'] + timedelta(minutes=30)
+            t0 = t_min
             
             y_labels = []
             fig = go.Figure()
@@ -2231,7 +2263,18 @@ def page_cooperative_tracing():
             for gi, group in enumerate(reversed(groups_sorted)):
                 gid = group['group_id']
                 num_stations = len(group['participating_stations'])
-                color_hex = group_colors_list[(len(groups_sorted) - 1 - gi) % len(group_colors_list)] if num_stations >= 3 else two_station_color
+                color_hex = group_color_map[gid]
+                
+                is_compared = gid in compare_selected
+                
+                if compare_selected:
+                    opacity = 1.0 if is_compared else 0.3
+                    line_width = 3 if is_compared else 1
+                    line_color = '#000000' if is_compared else 'white'
+                else:
+                    opacity = 0.9
+                    line_width = 1
+                    line_color = 'white'
                 
                 start_min = (group['earliest_time'] - t0).total_seconds() / 60.0
                 dur_min = max(0.5, (group['latest_time'] - group['earliest_time']).total_seconds() / 60.0)
@@ -2258,9 +2301,9 @@ def page_cooperative_tracing():
                     base=[start_min],
                     orientation='h',
                     marker_color=color_hex,
-                    marker_line_color='white',
-                    marker_line_width=1,
-                    opacity=0.9,
+                    marker_line_color=line_color,
+                    marker_line_width=line_width,
+                    opacity=opacity,
                     hovertemplate=hover_text + '<extra></extra>',
                     customdata=[gid],
                     showlegend=False,
@@ -2304,7 +2347,250 @@ def page_cooperative_tracing():
                         selected_gid = custom
                         break
             
-            gid_options = [g['group_id'] for g in groups_sorted]
+            def compute_comparison_data(selected_groups, groups_sorted, location_results, group_color_map):
+                comparison_data = []
+                
+                all_num_stations = [len(g['participating_stations']) for g in groups_sorted]
+                all_durations = [(g['latest_time'] - g['earliest_time']).total_seconds() / 60.0 for g in groups_sorted]
+                all_leq = [g['avg_peak_leq'] for g in groups_sorted]
+                all_sim = [g['avg_spectrum_similarity'] for g in groups_sorted]
+                all_uncertainty = []
+                for g in groups_sorted:
+                    loc = location_results.get(g['group_id'], {})
+                    unc = loc.get('uncertainty_m')
+                    if unc is not None:
+                        all_uncertainty.append(unc)
+                
+                max_stations = max(all_num_stations) if all_num_stations else 1
+                max_duration = max(all_durations) if all_durations else 1
+                max_leq = max(all_leq) if all_leq else 1
+                max_sim = max(all_sim) if all_sim else 1
+                max_uncertainty = max(all_uncertainty) if all_uncertainty else 1
+                min_uncertainty = min(all_uncertainty) if all_uncertainty else 0
+                
+                weights = {
+                    'stations': 0.3,
+                    'duration': 0.1,
+                    'leq': 0.2,
+                    'similarity': 0.25,
+                    'precision': 0.15
+                }
+                
+                for gid in selected_groups:
+                    group = next(g for g in groups_sorted if g['group_id'] == gid)
+                    loc = location_results.get(gid, {})
+                    
+                    num_stations = len(group['participating_stations'])
+                    duration_min = (group['latest_time'] - group['earliest_time']).total_seconds() / 60.0
+                    avg_peak_leq = group['avg_peak_leq']
+                    spectrum_similarity = group['avg_spectrum_similarity']
+                    uncertainty = loc.get('uncertainty_m')
+                    
+                    norm_stations = num_stations / max_stations if max_stations > 0 else 0
+                    norm_duration = duration_min / max_duration if max_duration > 0 else 0
+                    norm_leq = avg_peak_leq / max_leq if max_leq > 0 else 0
+                    norm_sim = spectrum_similarity / max_sim if max_sim > 0 else 0
+                    
+                    if uncertainty is not None and max_uncertainty > min_uncertainty:
+                        norm_precision = 1 - (uncertainty - min_uncertainty) / (max_uncertainty - min_uncertainty)
+                    elif uncertainty is not None:
+                        norm_precision = 1
+                    else:
+                        norm_precision = 0
+                    
+                    composite_score = (
+                        norm_stations * weights['stations'] +
+                        norm_duration * weights['duration'] +
+                        norm_leq * weights['leq'] +
+                        norm_sim * weights['similarity'] +
+                        norm_precision * weights['precision']
+                    )
+                    
+                    comparison_data.append({
+                        'group_id': gid,
+                        'num_stations': num_stations,
+                        'duration_min': duration_min,
+                        'avg_peak_leq': avg_peak_leq,
+                        'spectrum_similarity': spectrum_similarity,
+                        'uncertainty': uncertainty,
+                        'composite_score': composite_score,
+                        'color': group_color_map.get(gid, '#333333')
+                    })
+                
+                return comparison_data
+            
+            if len(compare_selected) >= 2:
+                comparison_data = compute_comparison_data(
+                    compare_selected, groups_sorted, location_results, group_color_map
+                )
+                
+                st.markdown("---")
+                st.markdown("##### 📊 多组对比分析面板")
+                
+                radar_categories = ['参与站点数', '持续时长', '平均峰值Leq', '频谱相似度', '定位不确定度']
+                num_vars = len(radar_categories)
+                
+                radar_fig = go.Figure()
+                
+                max_values = {
+                    'num_stations': max(d['num_stations'] for d in comparison_data),
+                    'duration_min': max(d['duration_min'] for d in comparison_data),
+                    'avg_peak_leq': max(d['avg_peak_leq'] for d in comparison_data),
+                    'spectrum_similarity': 1.0,
+                    'uncertainty': max((d['uncertainty'] if d['uncertainty'] else 0) for d in comparison_data)
+                }
+                
+                for d in comparison_data:
+                    gid = d['group_id']
+                    is_highlighted = (gid == st.session_state.coop_selected_group)
+                    line_width = 4 if is_highlighted else 2
+                    
+                    values = [
+                        d['num_stations'] / max_values['num_stations'] if max_values['num_stations'] > 0 else 0,
+                        d['duration_min'] / max_values['duration_min'] if max_values['duration_min'] > 0 else 0,
+                        d['avg_peak_leq'] / max_values['avg_peak_leq'] if max_values['avg_peak_leq'] > 0 else 0,
+                        d['spectrum_similarity'] / max_values['spectrum_similarity'],
+                        1 - (d['uncertainty'] / max_values['uncertainty'] if max_values['uncertainty'] > 0 and d['uncertainty'] else 0)
+                    ]
+                    values += values[:1]
+                    
+                    angles = [n / float(num_vars) * 2 * 3.14159 for n in range(num_vars)]
+                    angles += angles[:1]
+                    
+                    radar_fig.add_trace(go.Scatterpolar(
+                        r=values,
+                        theta=radar_categories + [radar_categories[0]],
+                        fill='toself',
+                        name=gid,
+                        line=dict(color=d['color'], width=line_width),
+                        marker=dict(size=6, color=d['color']),
+                        opacity=0.8,
+                        customdata=[gid]
+                    ))
+                
+                radar_fig.update_layout(
+                    polar=dict(
+                        radialaxis=dict(
+                            visible=True,
+                            range=[0, 1],
+                            ticktext=['0%', '20%', '40%', '60%', '80%', '100%'],
+                            tickvals=[0, 0.2, 0.4, 0.6, 0.8, 1.0]
+                        ),
+                        angularaxis=dict(
+                            tickfont=dict(size=11)
+                        )
+                    ),
+                    showlegend=True,
+                    legend=dict(
+                        orientation="h",
+                        yanchor="bottom",
+                        y=-0.1,
+                        xanchor="center",
+                        x=0.5
+                    ),
+                    height=450,
+                    margin=dict(l=20, r=20, t=30, b=80),
+                    title=dict(
+                        text='多维度对比雷达图',
+                        font=dict(size=14)
+                    )
+                )
+                
+                col_radar, col_table = st.columns([1, 1])
+                
+                with col_radar:
+                    radar_click = st.plotly_chart(
+                        radar_fig, 
+                        key="coop_radar_chart",
+                        on_select="rerun",
+                        use_container_width=True
+                    )
+                
+                with col_table:
+                    st.markdown("**对比数据表格**")
+                    st.caption("💡 点击表格中的组ID按钮可切换下方详情面板")
+                    
+                    for i, d in enumerate(comparison_data):
+                        is_highlighted = (d['group_id'] == st.session_state.coop_selected_group)
+                        bg_color = f"{d['color']}15" if is_highlighted else "#ffffff"
+                        border_color = d['color'] if is_highlighted else "#e0e0e0"
+                        weight = "bold" if is_highlighted else "normal"
+                        
+                        if i == 0:
+                            header_cols = st.columns([1.2, 1, 1.2, 1.2, 1, 1.3, 1])
+                            headers = ['组ID', '站点数', '持续(min)', '峰值(dB)', '频谱相似', '不确定度(m)', '综合评分']
+                            for j, h in enumerate(headers):
+                                with header_cols[j]:
+                                    st.markdown(f"<div style='text-align:center; font-weight:bold; color:#1565C0; font-size:12px;'>{h}</div>", unsafe_allow_html=True)
+                        
+                        cols = st.columns([1.2, 1, 1.2, 1.2, 1, 1.3, 1])
+                        with cols[0]:
+                            if st.button(
+                                f"📌 {d['group_id']}",
+                                key=f"table_goto_{d['group_id']}",
+                                help=f"点击查看{d['group_id']}详情",
+                                use_container_width=True,
+                                type="secondary" if not is_highlighted else "primary"
+                            ):
+                                st.session_state.coop_selected_group = d['group_id']
+                                st.rerun()
+                        with cols[1]:
+                            st.markdown(f"<div style='text-align:center; font-weight:{weight};'>{d['num_stations']}</div>", unsafe_allow_html=True)
+                        with cols[2]:
+                            st.markdown(f"<div style='text-align:center; font-weight:{weight};'>{d['duration_min']:.1f}</div>", unsafe_allow_html=True)
+                        with cols[3]:
+                            st.markdown(f"<div style='text-align:center; font-weight:{weight};'>{d['avg_peak_leq']:.1f}</div>", unsafe_allow_html=True)
+                        with cols[4]:
+                            st.markdown(f"<div style='text-align:center; font-weight:{weight};'>{d['spectrum_similarity']:.3f}</div>", unsafe_allow_html=True)
+                        with cols[5]:
+                            unc_text = f"{d['uncertainty']:.0f}" if d['uncertainty'] else 'N/A'
+                            st.markdown(f"<div style='text-align:center; font-weight:{weight};'>{unc_text}</div>", unsafe_allow_html=True)
+                        with cols[6]:
+                            st.markdown(f"<div style='text-align:center; font-weight:{weight}; color:#1976D2;'>{d['composite_score']:.3f}</div>", unsafe_allow_html=True)
+                        
+                        st.markdown(
+                            f"<div style='height:1px; background:linear-gradient(to right, transparent, {border_color}, transparent); margin:2px 0;'></div>",
+                            unsafe_allow_html=True
+                        )
+                
+                col_export1, col_export2 = st.columns([1, 3])
+                with col_export1:
+                    if st.button("📄 导出对比报告PDF", type="primary", key="export_compare_report", use_container_width=True):
+                        with st.spinner("正在生成对比报告..."):
+                            import plotly.io as pio
+                            radar_bytes = pio.to_image(radar_fig, format='png', width=800, height=600, scale=2)
+                            
+                            pdf_comparison_data = []
+                            for d in comparison_data:
+                                d_copy = dict(d)
+                                d_copy['highlighted'] = (d['group_id'] == st.session_state.coop_selected_group)
+                                pdf_comparison_data.append(d_copy)
+                            
+                            pdf_colors = {d['group_id']: d['color'] for d in comparison_data}
+                            
+                            pdf_bytes = generate_comparison_report_pdf(
+                                pdf_comparison_data,
+                                pdf_colors,
+                                radar_bytes
+                            )
+                            
+                            gids_str = "_".join(compare_selected)
+                            st.download_button(
+                                label="⬇️ 下载对比报告",
+                                data=pdf_bytes,
+                                file_name=f"协同事件组对比报告_{gids_str}_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+                                mime="application/pdf",
+                                type="primary",
+                                key="download_compare_pdf",
+                                use_container_width=True
+                            )
+                with col_export2:
+                    st.caption("📝 PDF报告包含：雷达图截图、对比数据表格、自动生成的分析总结")
+                
+                st.markdown("---")
+            elif len(compare_selected) > 0 and len(compare_selected) < 2:
+                st.info("ℹ️ 请至少选择2个事件组进行对比分析（最多选择5个）")
+            
             if selected_gid and selected_gid in gid_options:
                 default_idx = gid_options.index(selected_gid)
             elif st.session_state.coop_selected_group in gid_options:
@@ -2322,6 +2608,10 @@ def page_cooperative_tracing():
                 key="coop_group_selector"
             )
             st.session_state.coop_selected_group = selected_group
+            
+            if len(compare_selected) >= 2 and selected_group in compare_selected:
+                for d in comparison_data:
+                    d['highlighted'] = (d['group_id'] == selected_group)
             
             if selected_group:
                 group = next(g for g in groups_sorted if g['group_id'] == selected_group)

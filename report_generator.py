@@ -582,3 +582,172 @@ def generate_report_pdf(
     doc.build(elements)
     
     return buf.getvalue()
+
+
+def generate_radar_chart(comparison_data: List[Dict], group_colors: Dict[str, str]) -> plt.Figure:
+    fig = plt.figure(figsize=(8, 8))
+    ax = fig.add_subplot(111, polar=True)
+    
+    categories = ['参与站点数', '持续时长', '平均峰值Leq', '频谱相似度', '定位不确定度']
+    num_vars = len(categories)
+    angles = np.linspace(0, 2 * np.pi, num_vars, endpoint=False).tolist()
+    angles += angles[:1]
+    
+    max_values = {
+        '参与站点数': 10,
+        '持续时长': 60,
+        '平均峰值Leq': 100,
+        '频谱相似度': 1,
+        '定位不确定度': 500
+    }
+    
+    for data in comparison_data:
+        gid = data['group_id']
+        color = group_colors.get(gid, '#333333')
+        
+        values = [
+            min(data['num_stations'] / max_values['参与站点数'], 1),
+            min(data['duration_min'] / max_values['持续时长'], 1),
+            min(data['avg_peak_leq'] / max_values['平均峰值Leq'], 1),
+            data['spectrum_similarity'],
+            min(data['uncertainty'] / max_values['定位不确定度'], 1) if data['uncertainty'] else 0
+        ]
+        values += values[:1]
+        
+        line_width = 3 if data.get('highlighted', False) else 2
+        ax.plot(angles, values, 'o-', linewidth=line_width, color=color, label=gid, markersize=6)
+        ax.fill(angles, values, color=color, alpha=0.1)
+    
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(categories, fontsize=10, fontname=FONT_NAME)
+    ax.set_ylim(0, 1)
+    ax.set_yticks([0.2, 0.4, 0.6, 0.8, 1.0])
+    ax.set_yticklabels(['20%', '40%', '60%', '80%', '100%'], fontsize=8)
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc='upper right', bbox_to_anchor=(1.3, 1.1), fontsize=9, prop={'family': FONT_NAME})
+    ax.set_title('协同事件组多维度对比雷达图', fontsize=13, fontweight='bold', pad=20, fontname=FONT_NAME)
+    
+    fig.tight_layout()
+    return fig
+
+
+def generate_comparison_summary(comparison_data: List[Dict]) -> str:
+    if len(comparison_data) < 2:
+        return "请至少选择2个事件组进行对比分析。"
+    
+    gids = [d['group_id'] for d in comparison_data]
+    summary_parts = []
+    
+    station_score_best = max(comparison_data, key=lambda x: x['num_stations'])
+    duration_best = max(comparison_data, key=lambda x: x['duration_min'])
+    leq_best = max(comparison_data, key=lambda x: x['avg_peak_leq'])
+    sim_best = max(comparison_data, key=lambda x: x['spectrum_similarity'])
+    
+    uncertainty_data = [d for d in comparison_data if d['uncertainty'] is not None]
+    if uncertainty_data:
+        uncertainty_best = min(uncertainty_data, key=lambda x: x['uncertainty'])
+        summary_parts.append(f"{uncertainty_best['group_id']}号事件组定位精度最高（不确定度{uncertainty_best['uncertainty']:.0f}m）")
+    
+    summary_parts.append(f"{station_score_best['group_id']}号事件组站点覆盖度最广（{station_score_best['num_stations']}个站点）")
+    summary_parts.append(f"{duration_best['group_id']}号事件组持续时间最长（{duration_best['duration_min']:.1f}分钟）")
+    summary_parts.append(f"{leq_best['group_id']}号事件组噪声峰值最高（{leq_best['avg_peak_leq']:.1f}dB）")
+    summary_parts.append(f"{sim_best['group_id']}号事件组频谱相似度最高（{sim_best['spectrum_similarity']:.3f}）")
+    
+    overall_best = max(comparison_data, key=lambda x: x['composite_score'])
+    overall_worst = min(comparison_data, key=lambda x: x['composite_score'])
+    
+    summary = (
+        f"本次对比分析共涉及 {len(comparison_data)} 个协同事件组：{', '.join(gids)}。\n\n"
+        f"【主要发现】\n"
+        + "".join(f"• {p}\n" for p in summary_parts) +
+        f"\n【综合评估】\n"
+        f"• {overall_best['group_id']}号事件组综合评分最高（{overall_best['composite_score']:.3f}），在整体表现上最为突出。\n"
+        f"• {overall_worst['group_id']}号事件组综合评分相对较低（{overall_worst['composite_score']:.3f}），建议重点关注。\n\n"
+        f"【建议】\n"
+        f"• 优先对综合评分高的事件组进行溯源分析，其协同特征更为显著。\n"
+        f"• 对持续时间长、噪声峰值高的事件组，应加强监测并采取相应的降噪措施。"
+    )
+    
+    return summary
+
+
+def generate_comparison_report_pdf(
+    comparison_data: List[Dict],
+    group_colors: Dict[str, str],
+    radar_fig_bytes: bytes
+) -> bytes:
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+                            leftMargin=20 * mm, rightMargin=20 * mm,
+                            topMargin=20 * mm, bottomMargin=20 * mm)
+    
+    styles = _create_style()
+    elements = []
+    
+    elements.append(Paragraph('协同事件组对比分析报告', styles['title']))
+    elements.append(Paragraph(f'报告生成日期: {datetime.now().strftime("%Y年%m月%d日 %H:%M")}', styles['normal']))
+    elements.append(Spacer(1, 10))
+    
+    gids = [d['group_id'] for d in comparison_data]
+    elements.append(Paragraph(f'对比事件组: {", ".join(gids)}', styles['normal']))
+    elements.append(Spacer(1, 15))
+    
+    elements.append(Paragraph('一、多维度对比雷达图', styles['h2']))
+    
+    radar_img = io.BytesIO(radar_fig_bytes)
+    radar_img.seek(0)
+    elements.append(Image(radar_img, width=14 * cm, height=14 * cm))
+    elements.append(Spacer(1, 10))
+    
+    elements.append(Paragraph('二、对比数据表格', styles['h2']))
+    
+    table_headers = ['组ID', '参与站点数', '持续时长(min)', '平均峰值Leq(dB)', '频谱相似度', '定位不确定度(m)', '综合评分']
+    table_data = [[styles['table_header'](h) for h in table_headers]]
+    
+    for d in comparison_data:
+        row = [
+            d['group_id'],
+            str(d['num_stations']),
+            f"{d['duration_min']:.1f}",
+            f"{d['avg_peak_leq']:.1f}",
+            f"{d['spectrum_similarity']:.3f}",
+            f"{d['uncertainty']:.0f}" if d['uncertainty'] else 'N/A',
+            f"{d['composite_score']:.3f}"
+        ]
+        table_data.append(row)
+    
+    n_cols = len(table_headers)
+    col_widths = [160 * mm / n_cols] * n_cols
+    
+    t = Table(table_data, colWidths=col_widths, repeatRows=1)
+    
+    style_commands = [
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1565C0')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('FONTNAME', (0, 0), (-1, -1), FONT_NAME),
+        ('FONTSIZE', (0, 0), (-1, -1), 8),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#F5F5F5')]),
+        ('TOPPADDING', (0, 0), (-1, -1), 4),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+    ]
+    
+    t.setStyle(TableStyle(style_commands))
+    elements.append(t)
+    elements.append(Spacer(1, 15))
+    
+    elements.append(Paragraph('三、分析总结', styles['h2']))
+    
+    summary = generate_comparison_summary(comparison_data)
+    for line in summary.split('\n'):
+        if line.strip():
+            elements.append(Paragraph(line.strip(), styles['normal']))
+    
+    elements.append(Spacer(1, 30))
+    elements.append(Paragraph('— 报告结束 —', styles['normal']))
+    
+    doc.build(elements)
+    
+    return buf.getvalue()
