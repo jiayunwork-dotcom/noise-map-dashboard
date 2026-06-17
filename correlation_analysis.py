@@ -203,13 +203,15 @@ def _solve_tdoa_2station(station1: Tuple[float, float],
                           station2: Tuple[float, float],
                           delta_d: float,
                           num_points: int = 200,
-                          extend_factor: float = 3.0) -> List[Tuple[float, float]]:
+                          extend_factor: float = 5.0) -> List[Tuple[float, float]]:
     lat1, lon1 = station1
     lat2, lon2 = station2
     d = haversine_distance(lat1, lon1, lat2, lon2)
 
-    if abs(delta_d) >= d - 1e-3:
+    if d < 1.0:
         return []
+    if abs(delta_d) >= d - 1e-3:
+        delta_d = np.sign(delta_d) * (d - 1.0)
 
     mid_lat = (lat1 + lat2) / 2
     mid_lon = (lon1 + lon2) / 2
@@ -224,11 +226,13 @@ def _solve_tdoa_2station(station1: Tuple[float, float],
 
     a = delta_d / 2.0
     c = d / 2.0
-    if c * c <= a * a:
-        return []
+
+    if abs(a) < 1e-6:
+        a = 1e-6
+
     b_sq = c * c - a * a
     if b_sq <= 0:
-        return []
+        b_sq = max(b_sq, 1.0)
     b = math.sqrt(b_sq)
 
     dx = x2 - x1
@@ -238,7 +242,7 @@ def _solve_tdoa_2station(station1: Tuple[float, float],
     cos_a = math.cos(angle)
     sin_a = math.sin(angle)
 
-    max_t = extend_factor * max(c, 100.0)
+    max_t = extend_factor * max(c, 200.0)
     t_values = np.linspace(-max_t, max_t, num_points)
 
     points = []
@@ -246,11 +250,11 @@ def _solve_tdoa_2station(station1: Tuple[float, float],
     cy = (y1 + y2) / 2.0
 
     for t in t_values:
-        if abs(t) < abs(a):
-            x_h = math.sqrt((t * t) / (a * a) - 1) * b if a != 0 else 0
+        if abs(t) >= abs(a):
+            y_h = math.sqrt((t * t) / (a * a) - 1) * b if a != 0 else 0
             for sign in [1, -1]:
                 x_local = t
-                y_local = sign * x_h
+                y_local = sign * y_h
                 xr = cx + x_local * cos_a - y_local * sin_a
                 yr = cy + x_local * sin_a + y_local * cos_a
                 lon_r = mid_lon + xr * scale_lon
