@@ -233,7 +233,7 @@ def page_overview():
             fig, ax = plt.subplots(figsize=(6, 5))
             
             bins = [30, 40, 45, 50, 55, 60, 65, 70, 80, 90]
-            n, patches = ax.hist(latest_df['leq'], bins=bins, edgecolor='white',
+            n, _, patches = ax.hist(latest_df['leq'], bins=bins, edgecolor='white',
                                 linewidth=0.8, alpha=0.9)
             
             for i, patch in enumerate(patches):
