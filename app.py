@@ -83,7 +83,9 @@ def init_session_state():
         'coop_result': None,
         'coop_locations': None,
         'coop_compare_groups': [],
-        'coop_selected_group': None
+        'coop_selected_group': None,
+        'coop_pdf_data': None,
+        'coop_pdf_error': None
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -2398,6 +2400,8 @@ def page_cooperative_tracing():
                     else:
                         norm_precision = 0
                     
+                    norm_precision_for_radar = norm_precision
+                    
                     composite_score = (
                         norm_stations * weights['stations'] +
                         norm_duration * weights['duration'] +
@@ -2414,7 +2418,13 @@ def page_cooperative_tracing():
                         'spectrum_similarity': spectrum_similarity,
                         'uncertainty': uncertainty,
                         'composite_score': composite_score,
-                        'color': group_color_map.get(gid, '#333333')
+                        'color': group_color_map.get(gid, '#333333'),
+                        'norm_stations': norm_stations,
+                        'norm_duration': norm_duration,
+                        'norm_leq': norm_leq,
+                        'norm_sim': norm_sim,
+                        'norm_precision': norm_precision,
+                        'norm_precision_for_radar': norm_precision_for_radar
                     })
                 
                 return comparison_data
@@ -2432,25 +2442,17 @@ def page_cooperative_tracing():
                 
                 radar_fig = go.Figure()
                 
-                max_values = {
-                    'num_stations': max(d['num_stations'] for d in comparison_data),
-                    'duration_min': max(d['duration_min'] for d in comparison_data),
-                    'avg_peak_leq': max(d['avg_peak_leq'] for d in comparison_data),
-                    'spectrum_similarity': 1.0,
-                    'uncertainty': max((d['uncertainty'] if d['uncertainty'] else 0) for d in comparison_data)
-                }
-                
                 for d in comparison_data:
                     gid = d['group_id']
                     is_highlighted = (gid == st.session_state.coop_selected_group)
                     line_width = 4 if is_highlighted else 2
                     
                     values = [
-                        d['num_stations'] / max_values['num_stations'] if max_values['num_stations'] > 0 else 0,
-                        d['duration_min'] / max_values['duration_min'] if max_values['duration_min'] > 0 else 0,
-                        d['avg_peak_leq'] / max_values['avg_peak_leq'] if max_values['avg_peak_leq'] > 0 else 0,
-                        d['spectrum_similarity'] / max_values['spectrum_similarity'],
-                        1 - (d['uncertainty'] / max_values['uncertainty'] if max_values['uncertainty'] > 0 and d['uncertainty'] else 0)
+                        d['norm_stations'],
+                        d['norm_duration'],
+                        d['norm_leq'],
+                        d['norm_sim'],
+                        d['norm_precision_for_radar']
                     ]
                     values += values[:1]
                     
@@ -2555,37 +2557,74 @@ def page_cooperative_tracing():
                 
                 col_export1, col_export2 = st.columns([1, 3])
                 with col_export1:
-                    if st.button("📄 导出对比报告PDF", type="primary", key="export_compare_report", use_container_width=True):
-                        with st.spinner("正在生成对比报告..."):
-                            import plotly.io as pio
-                            radar_bytes = pio.to_image(radar_fig, format='png', width=800, height=600, scale=2)
-                            
-                            pdf_comparison_data = []
-                            for d in comparison_data:
-                                d_copy = dict(d)
-                                d_copy['highlighted'] = (d['group_id'] == st.session_state.coop_selected_group)
-                                pdf_comparison_data.append(d_copy)
-                            
-                            pdf_colors = {d['group_id']: d['color'] for d in comparison_data}
-                            
-                            pdf_bytes = generate_comparison_report_pdf(
-                                pdf_comparison_data,
-                                pdf_colors,
-                                radar_bytes
-                            )
-                            
-                            gids_str = "_".join(compare_selected)
+                    try:
+                        import plotly.io as pio
+                        
+                        def _generate_pdf():
+                            try:
+                                radar_bytes = pio.to_image(
+                                    radar_fig, format='png', 
+                                    width=800, height=600, scale=2,
+                                    engine='kaleido'
+                                )
+                                
+                                pdf_comparison_data = []
+                                for d in comparison_data:
+                                    d_copy = dict(d)
+                                    d_copy['highlighted'] = (d['group_id'] == st.session_state.coop_selected_group)
+                                    pdf_comparison_data.append(d_copy)
+                                
+                                pdf_colors = {d['group_id']: d['color'] for d in comparison_data}
+                                
+                                pdf_bytes = generate_comparison_report_pdf(
+                                    pdf_comparison_data,
+                                    pdf_colors,
+                                    radar_bytes
+                                )
+                                
+                                gids_str = "_".join(compare_selected)
+                                st.session_state.coop_pdf_data = {
+                                    'bytes': pdf_bytes,
+                                    'filename': f"协同事件组对比报告_{gids_str}_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
+                                }
+                            except Exception as e:
+                                st.session_state.coop_pdf_error = str(e)
+                        
+                        if st.button(
+                            "📄 导出对比报告PDF", 
+                            type="primary", 
+                            key="export_compare_report_btn",
+                            use_container_width=True,
+                            on_click=_generate_pdf
+                        ):
+                            pass
+                        
+                        if 'coop_pdf_data' in st.session_state and st.session_state.coop_pdf_data:
+                            pdf_data = st.session_state.coop_pdf_data
                             st.download_button(
                                 label="⬇️ 下载对比报告",
-                                data=pdf_bytes,
-                                file_name=f"协同事件组对比报告_{gids_str}_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+                                data=pdf_data['bytes'],
+                                file_name=pdf_data['filename'],
                                 mime="application/pdf",
                                 type="primary",
-                                key="download_compare_pdf",
+                                key="download_compare_pdf_final",
                                 use_container_width=True
                             )
+                            if st.button("清除PDF缓存", key="clear_pdf_cache", use_container_width=True):
+                                st.session_state.coop_pdf_data = None
+                                st.rerun()
+                        
+                        if 'coop_pdf_error' in st.session_state and st.session_state.coop_pdf_error:
+                            st.error(f"❌ PDF生成失败: {st.session_state.coop_pdf_error}")
+                            if st.button("清除错误", key="clear_pdf_error", use_container_width=True):
+                                st.session_state.coop_pdf_error = None
+                                st.rerun()
+                    except Exception as import_err:
+                        st.error(f"❌ 依赖缺失: {import_err}")
+                        st.info("请确保已安装 kaleido 包: pip install kaleido")
                 with col_export2:
                     st.caption("📝 PDF报告包含：雷达图截图、对比数据表格、自动生成的分析总结")
+                    st.caption("💡 提示：首次点击'导出PDF'生成报告，生成后可点击'下载'按钮保存文件")
                 
                 st.markdown("---")
             elif len(compare_selected) > 0 and len(compare_selected) < 2:

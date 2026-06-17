@@ -584,53 +584,6 @@ def generate_report_pdf(
     return buf.getvalue()
 
 
-def generate_radar_chart(comparison_data: List[Dict], group_colors: Dict[str, str]) -> plt.Figure:
-    fig = plt.figure(figsize=(8, 8))
-    ax = fig.add_subplot(111, polar=True)
-    
-    categories = ['参与站点数', '持续时长', '平均峰值Leq', '频谱相似度', '定位不确定度']
-    num_vars = len(categories)
-    angles = np.linspace(0, 2 * np.pi, num_vars, endpoint=False).tolist()
-    angles += angles[:1]
-    
-    max_values = {
-        '参与站点数': 10,
-        '持续时长': 60,
-        '平均峰值Leq': 100,
-        '频谱相似度': 1,
-        '定位不确定度': 500
-    }
-    
-    for data in comparison_data:
-        gid = data['group_id']
-        color = group_colors.get(gid, '#333333')
-        
-        values = [
-            min(data['num_stations'] / max_values['参与站点数'], 1),
-            min(data['duration_min'] / max_values['持续时长'], 1),
-            min(data['avg_peak_leq'] / max_values['平均峰值Leq'], 1),
-            data['spectrum_similarity'],
-            min(data['uncertainty'] / max_values['定位不确定度'], 1) if data['uncertainty'] else 0
-        ]
-        values += values[:1]
-        
-        line_width = 3 if data.get('highlighted', False) else 2
-        ax.plot(angles, values, 'o-', linewidth=line_width, color=color, label=gid, markersize=6)
-        ax.fill(angles, values, color=color, alpha=0.1)
-    
-    ax.set_xticks(angles[:-1])
-    ax.set_xticklabels(categories, fontsize=10, fontname=FONT_NAME)
-    ax.set_ylim(0, 1)
-    ax.set_yticks([0.2, 0.4, 0.6, 0.8, 1.0])
-    ax.set_yticklabels(['20%', '40%', '60%', '80%', '100%'], fontsize=8)
-    ax.grid(True, alpha=0.3)
-    ax.legend(loc='upper right', bbox_to_anchor=(1.3, 1.1), fontsize=9, prop={'family': FONT_NAME})
-    ax.set_title('协同事件组多维度对比雷达图', fontsize=13, fontweight='bold', pad=20, fontname=FONT_NAME)
-    
-    fig.tight_layout()
-    return fig
-
-
 def generate_comparison_summary(comparison_data: List[Dict]) -> str:
     if len(comparison_data) < 2:
         return "请至少选择2个事件组进行对比分析。"
