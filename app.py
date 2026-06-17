@@ -388,7 +388,7 @@ def page_data_import():
                                      'l10', 'l50', 'l90', 'zone_type']
                        if c in latest_df.columns]
         st.dataframe(
-            latest_df[display_cols].style.applymap(
+            latest_df[display_cols].style.map(
                 lambda x: 'background-color: #ffebee; color: #c62828; font-weight: bold'
                 if isinstance(x, (int, float)) and (x < MIN_SOUND_LEVEL or x > MAX_SOUND_LEVEL) else ''
             ),

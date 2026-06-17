@@ -102,7 +102,7 @@ def create_grid(bounds: Tuple[float, float, float, float],
     grid_lon, grid_lat = np.meshgrid(x_lon, y_lat)
     grid_points = np.column_stack([grid_lon.ravel(), grid_lat.ravel()])
     
-    return grid_points, np.array([x_lon, y_lat]), (ny, nx)
+    return grid_points, (x_lon, y_lat), (ny, nx)
 
 
 def compute_experimental_variogram(coords_m: np.ndarray, values: np.ndarray,

@@ -1,0 +1,185 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "居民区A",
+        "zone_name": "居民区A",
+        "zone_type": 1,
+        "type": 1
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              116.35,
+              39.88
+            ],
+            [
+              116.38,
+              39.88
+            ],
+            [
+              116.38,
+              39.91
+            ],
+            [
+              116.35,
+              39.91
+            ],
+            [
+              116.35,
+              39.88
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "商业区B",
+        "zone_name": "商业区B",
+        "zone_type": 2,
+        "type": 2
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              116.38,
+              39.88
+            ],
+            [
+              116.42,
+              39.88
+            ],
+            [
+              116.42,
+              39.91
+            ],
+            [
+              116.38,
+              39.91
+            ],
+            [
+              116.38,
+              39.88
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "工业区C",
+        "zone_name": "工业区C",
+        "zone_type": 3,
+        "type": 3
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              116.42,
+              39.88
+            ],
+            [
+              116.46,
+              39.88
+            ],
+            [
+              116.46,
+              39.91
+            ],
+            [
+              116.42,
+              39.91
+            ],
+            [
+              116.42,
+              39.88
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "文教区D",
+        "zone_name": "文教区D",
+        "zone_type": 1,
+        "type": 1
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              116.28,
+              39.94
+            ],
+            [
+              116.33,
+              39.94
+            ],
+            [
+              116.33,
+              39.99
+            ],
+            [
+              116.28,
+              39.99
+            ],
+            [
+              116.28,
+              39.94
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "交通干线E",
+        "zone_name": "交通干线E",
+        "zone_type": 4,
+        "type": 4
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              116.33,
+              39.915
+            ],
+            [
+              116.48,
+              39.915
+            ],
+            [
+              116.48,
+              39.935
+            ],
+            [
+              116.33,
+              39.935
+            ],
+            [
+              116.33,
+              39.915
+            ]
+          ]
+        ]
+      }
+    }
+  ]
+}
