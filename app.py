@@ -2209,120 +2209,185 @@ def page_cooperative_tracing():
         st.caption("🟠 橙色圆圈 = 2站协同事件（仅提供双曲线，无法精确定位） | 🔴 红色圆圈 = 3站以上声源定位结果")
     
     with tab_timeline:
-        st.markdown("#### 协同事件组时间轴 - 点击色块展开详情")
-        st.caption("💡 直接点击下方任意事件组标题栏即可展开查看详细信息，无需滚动查找")
+        st.markdown("#### 协同事件组时间轴 - 点击色块查看详情")
+        st.caption("💡 点击图表中的色块即可选中对应事件组，下方自动展示该组详细信息")
         
         groups_sorted = sorted(cooperative_groups, key=lambda g: g['earliest_time'])
         
         if groups_sorted:
+            import plotly.graph_objects as go
+            
             t_min = groups_sorted[0]['earliest_time'] - timedelta(minutes=30)
             t_max = groups_sorted[-1]['latest_time'] + timedelta(minutes=30)
-            total_span_min = max(5, (t_max - t_min).total_seconds() / 60.0)
+            t0 = t_min
             
-            group_colors = ['#E53935', '#D81B60', '#8E24AA', '#5E35B1',
+            group_colors_list = ['#E53935', '#D81B60', '#8E24AA', '#5E35B1',
                             '#3949AB', '#1E88E5', '#00ACC1', '#00897B']
             two_station_color = '#FF9800'
             
-            for gi, group in enumerate(groups_sorted):
+            y_labels = []
+            fig = go.Figure()
+            
+            for gi, group in enumerate(reversed(groups_sorted)):
                 gid = group['group_id']
                 num_stations = len(group['participating_stations'])
-                color_hex = group_colors[gi % len(group_colors)] if num_stations >= 3 else two_station_color
+                color_hex = group_colors_list[(len(groups_sorted) - 1 - gi) % len(group_colors_list)] if num_stations >= 3 else two_station_color
                 
-                start_offset = (group['earliest_time'] - t_min).total_seconds() / 60.0
-                duration = max(1, (group['latest_time'] - group['earliest_time']).total_seconds() / 60.0)
-                left_pct = (start_offset / total_span_min) * 100
-                width_pct = max(1.5, (duration / total_span_min) * 100)
+                start_min = (group['earliest_time'] - t0).total_seconds() / 60.0
+                dur_min = max(0.5, (group['latest_time'] - group['earliest_time']).total_seconds() / 60.0)
                 
-                time_label = group['earliest_time'].strftime('%H:%M:%S')
-                icon = "🎯" if num_stations >= 3 else "📐"
                 loc_tag = "精确定位" if num_stations >= 3 else "仅双曲线"
+                stations_str = ", ".join(group['participating_stations'])
                 
-                bar_html = f"""
-                <div style="width:100%;display:flex;align-items:center;margin-bottom:2px;">
-                    <div style="width:95px;flex-shrink:0;font-size:12px;color:#555;padding-right:8px;text-align:right;font-weight:500;">
-                        {time_label}
-                    </div>
-                    <div style="flex:1;position:relative;height:24px;background:#f0f2f6;border-radius:3px;">
-                        <div style="position:absolute;left:{left_pct}%;width:{width_pct}%;height:100%;
-                                    background:{color_hex};border-radius:3px;opacity:0.85;min-width:30px;">
-                        </div>
-                    </div>
-                </div>
-                """
+                y_label = f"{gid} [{num_stations}站]"
+                y_labels.append(y_label)
                 
-                title_parts = [
-                    f"{icon} <b style='color:{color_hex};font-size:15px;'>{gid}</b>",
-                    f"[{num_stations}站 · {loc_tag}]",
-                    f"🕐 {group['earliest_time'].strftime('%m-%d %H:%M:%S')}",
-                    f"⏱️ {duration:.0f}min",
-                    f"📈 {group['avg_peak_leq']:.0f}dB",
-                    f"👥 {', '.join(group['participating_stations'])}"
-                ]
-                title_html = " &nbsp;|&nbsp; ".join(title_parts)
+                hover_text = (
+                    f"<b>{gid}</b><br>"
+                    f"站点数: {num_stations} ({loc_tag})<br>"
+                    f"时间: {group['earliest_time'].strftime('%m-%d %H:%M:%S')}<br>"
+                    f"持续: {dur_min:.1f} min<br>"
+                    f"峰值Leq: {group['avg_peak_leq']:.1f} dB<br>"
+                    f"参与站点: {stations_str}<br>"
+                    f"频谱相似度: {group['avg_spectrum_similarity']:.3f}"
+                )
                 
-                st.components.v1.html(bar_html, height=26)
+                fig.add_trace(go.Bar(
+                    y=[y_label],
+                    x=[dur_min],
+                    base=[start_min],
+                    orientation='h',
+                    marker_color=color_hex,
+                    marker_line_color='white',
+                    marker_line_width=1,
+                    opacity=0.9,
+                    hovertemplate=hover_text + '<extra></extra>',
+                    customdata=[gid],
+                    showlegend=False,
+                    text=f"{gid}",
+                    textposition='inside',
+                    insidetextanchor='middle',
+                    textfont=dict(color='white', size=11),
+                ))
+            
+            fig.update_layout(
+                height=max(300, len(groups_sorted) * 28 + 80),
+                margin=dict(l=120, r=30, t=40, b=50),
+                barmode='overlay',
+                yaxis=dict(
+                    tickmode='array',
+                    tickvals=y_labels,
+                    ticktext=y_labels,
+                    tickfont=dict(size=11),
+                ),
+                xaxis=dict(
+                    title=f'时间 (分钟，起始 {t0.strftime("%m-%d %H:%M")})',
+                    tickfont=dict(size=10),
+                ),
+                plot_bgcolor='#fafafa',
+                hoverlabel=dict(
+                    bgcolor='white',
+                    font_size=13,
+                    font_family='sans-serif',
+                ),
+                dragmode='select',
+            )
+            
+            selected_gid = None
+            chart_result = st.plotly_chart(fig, on_select="rerun", key="coop_timeline_chart")
+            
+            selection_points = chart_result.get("selection", {}).get("points", [])
+            if selection_points:
+                for pt in selection_points:
+                    custom = pt.get("customdata")
+                    if custom:
+                        selected_gid = custom
+                        break
+            
+            gid_options = [g['group_id'] for g in groups_sorted]
+            if selected_gid and selected_gid in gid_options:
+                default_idx = gid_options.index(selected_gid)
+            elif st.session_state.coop_selected_group in gid_options:
+                default_idx = gid_options.index(st.session_state.coop_selected_group)
+            else:
+                default_idx = 0
+            
+            st.markdown("---")
+            
+            selected_group = st.selectbox(
+                "📋 选中事件组",
+                options=gid_options,
+                index=default_idx,
+                format_func=lambda x: f"{x} - {next((g['earliest_time'].strftime('%m-%d %H:%M:%S') for g in groups_sorted if g['group_id'] == x), '')} ({next((len(g['participating_stations']) for g in groups_sorted if g['group_id'] == x), 0)}站)",
+                key="coop_group_selector"
+            )
+            st.session_state.coop_selected_group = selected_group
+            
+            if selected_group:
+                group = next(g for g in groups_sorted if g['group_id'] == selected_group)
+                loc = location_results.get(selected_group, {})
+                num_stations = len(group['participating_stations'])
                 
-                with st.expander(title_html, expanded=False):
-                    st.markdown("")
-                    loc = location_results.get(gid, {})
-                    
-                    col_d1, col_d2, col_d3, col_d4 = st.columns(4)
-                    with col_d1:
-                        st.metric("参与站点数", f"{num_stations} 个",
-                                 help="3个及以上可进行精确定位")
-                    with col_d2:
-                        st.metric("最早触发站", group['earliest_station'])
-                    with col_d3:
-                        if loc.get('bearing_deg') is not None:
-                            st.metric("估计方位角", f"{loc['bearing_deg']:.1f}°")
-                        else:
-                            st.metric("定位状态", "仅双曲线" if num_stations == 2 else "N/A")
-                    with col_d4:
-                        if loc.get('distance_from_earliest_m') is not None:
-                            st.metric("估计距离", f"{loc['distance_from_earliest_m']:.0f} m")
-                        else:
-                            st.metric("频谱相似度", f"{group['avg_spectrum_similarity']:.3f}")
-                    
-                    st.markdown("")
-                    st.markdown("**各站点触发时间差 (相对最早站)**")
-                    td_rows = []
-                    for sid, td in sorted(group['time_diffs'].items(), key=lambda x: x[1]):
-                        td_rows.append({
-                            '站点': sid,
-                            '到达时间差 (秒)': f"{td:.2f}",
-                            '对应距离差 (m)': f"{td * SOUND_SPEED:.0f}",
-                            '触发顺序': f"第 {list(group['time_diffs'].keys()).index(sid) + 1} 个"
-                        })
-                    st.table(pd.DataFrame(td_rows))
-                    
-                    if num_stations == 2:
-                        st.warning("⚠️ 该事件组仅有2个站点参与，仅能绘制TDOA等距差双曲线，声源可能位于双曲线上任意位置，无法精确定位。建议增加监测站点数量以提高定位精度。")
-                    elif loc.get('uncertainty_m') is not None:
-                        st.caption(f"📍 定位不确定度: ±{loc['uncertainty_m']:.0f}m | 定位RMSE: {loc.get('rmse', 'N/A'):.1f} | 频谱相似度: {group['avg_spectrum_similarity']:.3f}")
-                    
-                    st.markdown("")
-                    st.markdown("**参与站点的事件详情**")
-                    event_detail_rows = []
-                    for e in group['events']:
-                        dur_h = int(e['duration_minutes'] // 60)
-                        dur_m = int(e['duration_minutes'] % 60)
-                        dur_str = f"{dur_h}h{dur_m}min" if dur_h > 0 else f"{dur_m}min"
-                        icon = e.get('icon', '❓') if e.get('icon') else '❓'
-                        source = e.get('source_name', '未知') if e.get('source_name') else '未知'
-                        event_detail_rows.append({
-                            '站点': e['station_id'],
-                            '开始时间': e['start_time'].strftime('%Y-%m-%d %H:%M:%S'),
-                            '结束时间': e['end_time'].strftime('%Y-%m-%d %H:%M:%S'),
-                            '峰值Leq': f"{e['peak_leq']:.1f} dB",
-                            '持续时长': dur_str,
-                            '推测来源': f"{icon} {source}"
-                        })
-                    st.table(pd.DataFrame(event_detail_rows))
-                    
-                    st.markdown("")
-                    st.info("💡 在上方「溯源地图」标签页可查看该事件组的TDOA双曲线和声源位置标记")
+                if num_stations >= 3:
+                    gi_orig = gid_options.index(selected_group)
+                    highlight_color = group_colors_list[gi_orig % len(group_colors_list)]
+                else:
+                    highlight_color = two_station_color
                 
-                st.markdown("---")
+                st.markdown(f'<div style="border-left:4px solid {highlight_color};padding-left:12px;margin:4px 0;">', unsafe_allow_html=True)
+                
+                col_d1, col_d2, col_d3, col_d4 = st.columns(4)
+                with col_d1:
+                    st.metric("参与站点数", f"{num_stations} 个",
+                             help="3个及以上可进行精确定位")
+                with col_d2:
+                    st.metric("最早触发站", group['earliest_station'])
+                with col_d3:
+                    if loc.get('bearing_deg') is not None:
+                        st.metric("估计方位角", f"{loc['bearing_deg']:.1f}°")
+                    else:
+                        st.metric("定位状态", "仅双曲线" if num_stations == 2 else "N/A")
+                with col_d4:
+                    if loc.get('distance_from_earliest_m') is not None:
+                        st.metric("估计距离", f"{loc['distance_from_earliest_m']:.0f} m")
+                    else:
+                        st.metric("频谱相似度", f"{group['avg_spectrum_similarity']:.3f}")
+                
+                st.markdown("</div>", unsafe_allow_html=True)
+                
+                st.markdown("**各站点触发时间差 (相对最早站)**")
+                td_rows = []
+                for sid, td in sorted(group['time_diffs'].items(), key=lambda x: x[1]):
+                    td_rows.append({
+                        '站点': sid,
+                        '到达时间差 (秒)': f"{td:.2f}",
+                        '对应距离差 (m)': f"{td * SOUND_SPEED:.0f}",
+                        '触发顺序': f"第 {list(group['time_diffs'].keys()).index(sid) + 1} 个"
+                    })
+                st.table(pd.DataFrame(td_rows))
+                
+                if num_stations == 2:
+                    st.warning("⚠️ 该事件组仅有2个站点参与，仅能绘制TDOA等距差双曲线，声源可能位于双曲线上任意位置，无法精确定位。建议增加监测站点数量以提高定位精度。")
+                elif loc.get('uncertainty_m') is not None:
+                    st.caption(f"📍 定位不确定度: ±{loc['uncertainty_m']:.0f}m | 定位RMSE: {loc.get('rmse', 'N/A'):.1f} | 频谱相似度: {group['avg_spectrum_similarity']:.3f}")
+                
+                st.markdown("**参与站点的事件详情**")
+                event_detail_rows = []
+                for e in group['events']:
+                    dur_h = int(e['duration_minutes'] // 60)
+                    dur_m = int(e['duration_minutes'] % 60)
+                    dur_str = f"{dur_h}h{dur_m}min" if dur_h > 0 else f"{dur_m}min"
+                    e_icon = e.get('icon', '❓') if e.get('icon') else '❓'
+                    source = e.get('source_name', '未知') if e.get('source_name') else '未知'
+                    event_detail_rows.append({
+                        '站点': e['station_id'],
+                        '开始时间': e['start_time'].strftime('%Y-%m-%d %H:%M:%S'),
+                        '结束时间': e['end_time'].strftime('%Y-%m-%d %H:%M:%S'),
+                        '峰值Leq': f"{e['peak_leq']:.1f} dB",
+                        '持续时长': dur_str,
+                        '推测来源': f"{e_icon} {source}"
+                    })
+                st.table(pd.DataFrame(event_detail_rows))
     
     with tab_table:
         st.markdown("#### 协同事件组汇总统计表")
