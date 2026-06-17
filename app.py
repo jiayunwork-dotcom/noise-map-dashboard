@@ -576,41 +576,69 @@ def create_noise_map(interp_result: Dict, stations_df: pd.DataFrame) -> folium.M
         tiles='OpenStreetMap'
     )
     
-    from PIL import Image as PILImage
-    import io
-    
-    ny, nx = z.shape
-    rgb_img = np.zeros((ny, nx, 4), dtype=np.uint8)
-    
-    opacity = st.session_state.heatmap_opacity
-    
-    from contour_utils import value_to_rgb
-    
-    for i in range(ny):
-        for j in range(nx):
-            val = z[i, j]
-            if np.isnan(val):
-                continue
-            r, g, b, _ = value_to_rgb(val)
-            rgb_img[i, j] = [r, g, b, int(255 * opacity)]
-    
-    rgb_img = np.flipud(rgb_img)
-    
-    pil_img = PILImage.fromarray(rgb_img, 'RGBA')
-    img_bytes = io.BytesIO()
-    pil_img.save(img_bytes, format='PNG')
-    img_bytes.seek(0)
-    
-    img_bounds = [[grid_lat[-1], grid_lon[0]], [grid_lat[0], grid_lon[-1]]]
-    
-    folium.raster_layers.ImageOverlay(
-        image=img_bytes,
-        bounds=img_bounds,
-        opacity=1.0,
-        interactive=False,
-        cross_origin=False,
-        zindex=1
-    ).add_to(m)
+    try:
+        from PIL import Image as PILImage
+        import io
+        import base64
+        
+        ny, nx = z.shape
+        rgb_img = np.zeros((ny, nx, 4), dtype=np.uint8)
+        
+        opacity = st.session_state.heatmap_opacity
+        
+        from contour_utils import value_to_rgb
+        
+        valid_count = 0
+        for i in range(ny):
+            for j in range(nx):
+                val = z[i, j]
+                if np.isnan(val):
+                    continue
+                r, g, b, _ = value_to_rgb(val)
+                rgb_img[i, j] = [r, g, b, int(255 * opacity)]
+                valid_count += 1
+        
+        if valid_count == 0:
+            st.warning("⚠️ 没有有效的插值数据可用于渲染热力图")
+        else:
+            rgb_img = np.flipud(rgb_img)
+            
+            max_size = 2000
+            if ny > max_size or nx > max_size:
+                scale = min(max_size / ny, max_size / nx)
+                new_ny = max(2, int(ny * scale))
+                new_nx = max(2, int(nx * scale))
+                pil_img = PILImage.fromarray(rgb_img, 'RGBA')
+                try:
+                    resample_method = PILImage.Resampling.BILINEAR
+                except AttributeError:
+                    resample_method = PILImage.BILINEAR
+                pil_img = pil_img.resize((new_nx, new_ny), resample_method)
+                st.caption(f"ℹ️ 热力图已自动缩放至 {new_nx}×{new_ny} 以提高性能")
+            else:
+                pil_img = PILImage.fromarray(rgb_img, 'RGBA')
+            
+            img_bytes = io.BytesIO()
+            pil_img.save(img_bytes, format='PNG', optimize=True)
+            img_bytes.seek(0)
+            
+            img_base64 = base64.b64encode(img_bytes.read()).decode('utf-8')
+            img_data_uri = f'data:image/png;base64,{img_base64}'
+            
+            img_bounds = [[grid_lat[0], grid_lon[0]], [grid_lat[-1], grid_lon[-1]]]
+            
+            folium.raster_layers.ImageOverlay(
+                image=img_data_uri,
+                bounds=img_bounds,
+                opacity=1.0,
+                interactive=True,
+                zindex=10
+            ).add_to(m)
+            
+    except Exception as e:
+        st.error(f"❌ 热力图渲染失败: {str(e)}")
+        import traceback
+        st.code(traceback.format_exc(), language="python")
     
     if st.session_state.show_contours and st.session_state.contour_data:
         for contour in st.session_state.contour_data:
