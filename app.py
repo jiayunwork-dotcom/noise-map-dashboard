@@ -35,6 +35,11 @@ from time_analysis import get_station_time_analysis, calculate_hourly_pattern, d
 from spectrum_analysis import get_station_source_analysis, generate_source_recommendations
 from noise_prediction import predict_road_traffic_noise, generate_prediction_contour
 from report_generator import generate_report_pdf
+from correlation_analysis import (
+    compute_station_distance_matrix, detect_events_for_stations,
+    match_cooperative_events, estimate_source_location,
+    export_traceability_geojson, haversine_distance, SOUND_SPEED
+)
 
 st.set_page_config(
     page_title="城市噪声地图分析系统",
@@ -71,7 +76,12 @@ def init_session_state():
         'interpolation_done': False,
         'variogram_params': None,
         'selected_time_filter': None,
-        'event_threshold': 10.0
+        'event_threshold': 10.0,
+        'coop_selected_stations': [],
+        'coop_spectrum_threshold': 0.7,
+        'coop_time_tolerance': 2.0,
+        'coop_result': None,
+        'coop_locations': None
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -96,6 +106,7 @@ def main():
             "📈 时间分析",
             "🔊 声源识别",
             "🛣️ 噪声预测",
+            "🎯 协同溯源",
             "📄 统计报告"
         ]
     )
@@ -117,6 +128,8 @@ def main():
         page_source_identification()
     elif page.startswith("🛣️"):
         page_noise_prediction()
+    elif page.startswith("🎯"):
+        page_cooperative_tracing()
     elif page.startswith("📄"):
         page_report()
 
@@ -1872,6 +1885,442 @@ def page_report():
                 st.error(f"报告生成失败: {e}")
                 import traceback
                 st.code(traceback.format_exc())
+
+
+def page_cooperative_tracing():
+    st.header("🎯 多站点协同监测与异常溯源")
+    
+    stations_df = get_all_stations()
+    if stations_df.empty:
+        st.warning("暂无监测站点数据，请先导入数据。")
+        return
+    
+    st.markdown("### 📍 步骤1: 选择监测站点")
+    st.info("请选择 3~8 个监测站点进行协同分析，系统将自动计算站点间的传播时延并匹配协同事件")
+    
+    col_sel, col_info = st.columns([3, 2])
+    
+    with col_sel:
+        station_options = []
+        for _, row in stations_df.iterrows():
+            label = f"{row.get('station_name', row['station_id'])} ({row['station_id']})"
+            station_options.append((row['station_id'], label))
+        
+        default_selected = st.session_state.coop_selected_stations
+        if not default_selected and len(station_options) >= 3:
+            default_selected = [s[0] for s in station_options[:min(4, len(station_options))]]
+        
+        selected_ids = st.multiselect(
+            "选择监测站点 (3~8个)",
+            options=[s[0] for s in station_options],
+            format_func=lambda x: next((lbl for sid, lbl in station_options if sid == x), x),
+            default=default_selected,
+            key="coop_station_multiselect"
+        )
+        st.session_state.coop_selected_stations = selected_ids
+    
+    with col_info:
+        valid_count = len(selected_ids)
+        if valid_count < 3:
+            st.warning(f"⚠️ 当前已选 {valid_count} 个站点，至少需要选择 3 个")
+        elif valid_count > 8:
+            st.warning(f"⚠️ 当前已选 {valid_count} 个站点，最多选择 8 个")
+        else:
+            st.success(f"✅ 已选择 {valid_count} 个站点")
+    
+    if len(selected_ids) < 3:
+        return
+    
+    selected_stations = stations_df[stations_df['station_id'].isin(selected_ids)].copy()
+    selected_stations = selected_stations.set_index('station_id').loc[selected_ids].reset_index()
+    
+    dist_matrix, delay_matrix, station_ids = compute_station_distance_matrix(selected_stations)
+    n = len(station_ids)
+    
+    st.markdown("---")
+    st.markdown("### 📐 站点邻接矩阵")
+    
+    col_dist, col_delay = st.columns(2)
+    
+    with col_dist:
+        st.markdown("#### 直线距离 (米)")
+        dist_data = []
+        for i in range(n):
+            row = {'站点': station_ids[i]}
+            for j in range(n):
+                row[station_ids[j]] = f"{dist_matrix[i, j]:.0f}" if i != j else "-"
+            dist_data.append(row)
+        dist_df = pd.DataFrame(dist_data).set_index('站点')
+        st.dataframe(dist_df, use_container_width=True)
+    
+    with col_delay:
+        st.markdown(f"#### 预估传播时延 (秒, 声速={SOUND_SPEED}m/s)")
+        delay_data = []
+        for i in range(n):
+            row = {'站点': station_ids[i]}
+            for j in range(n):
+                row[station_ids[j]] = f"{delay_matrix[i, j]:.2f}" if i != j else "-"
+            delay_data.append(row)
+        delay_df = pd.DataFrame(delay_data).set_index('站点')
+        st.dataframe(delay_df, use_container_width=True)
+    
+    st.markdown("---")
+    st.markdown("### ⚙️ 步骤2: 分析参数设置")
+    
+    col_p1, col_p2, col_p3 = st.columns(3)
+    with col_p1:
+        event_threshold = st.slider(
+            "事件检测阈值 (dB)",
+            min_value=5, max_value=20, value=int(st.session_state.event_threshold), step=1,
+            help="Leq相对背景升高超过此阈值即标记为噪声事件"
+        )
+    with col_p2:
+        spectrum_threshold = st.slider(
+            "频谱相似度阈值",
+            min_value=0.3, max_value=0.95,
+            value=st.session_state.coop_spectrum_threshold, step=0.05,
+            help="余弦相似度高于此阈值认为事件频谱特征相似"
+        )
+        st.session_state.coop_spectrum_threshold = spectrum_threshold
+    with col_p3:
+        time_tolerance = st.slider(
+            "时间容差 (秒)",
+            min_value=0.5, max_value=10.0,
+            value=st.session_state.coop_time_tolerance, step=0.5,
+            help="允许的时间匹配误差范围"
+        )
+        st.session_state.coop_time_tolerance = time_tolerance
+    
+    run_btn = st.button("🚀 开始协同溯源分析", type="primary", use_container_width=True)
+    
+    cooperative_groups = None
+    location_results = None
+    
+    if run_btn:
+        with st.spinner("正在检测各站点噪声事件..."):
+            all_events = detect_events_for_stations(selected_ids, threshold_db=float(event_threshold))
+        
+        total_events = sum(len(v) for v in all_events.values())
+        st.info(f"📊 共检测到 {total_events} 个噪声事件")
+        
+        with st.spinner("正在匹配协同事件组..."):
+            cooperative_groups = match_cooperative_events(
+                all_events, delay_matrix, station_ids,
+                spectrum_threshold=spectrum_threshold,
+                time_tolerance=time_tolerance
+            )
+            st.session_state.coop_result = cooperative_groups
+        
+        with st.spinner("正在估计声源位置..."):
+            location_results = {}
+            for group in cooperative_groups:
+                loc = estimate_source_location(group, selected_stations)
+                location_results[group['group_id']] = loc
+            st.session_state.coop_locations = location_results
+    else:
+        cooperative_groups = st.session_state.coop_result
+        location_results = st.session_state.coop_locations
+    
+    if cooperative_groups is None:
+        return
+    
+    st.markdown("---")
+    st.markdown("### 🎯 步骤3: 溯源结果")
+    
+    if not cooperative_groups:
+        st.warning("未检测到跨站点的协同噪声事件，建议尝试：\n"
+                  "- 降低事件检测阈值\n"
+                  "- 降低频谱相似度阈值\n"
+                  "- 增大时间容差范围")
+        return
+    
+    loc_count = sum(1 for loc in location_results.values() if loc.get('located') and loc.get('latitude'))
+    
+    col_r1, col_r2, col_r3, col_r4 = st.columns(4)
+    with col_r1:
+        st.metric("协同事件组数", f"{len(cooperative_groups)} 组")
+    with col_r2:
+        st.metric("成功定位组数", f"{loc_count} 组")
+    with col_r3:
+        all_stations_in = set()
+        for g in cooperative_groups:
+            all_stations_in.update(g['participating_stations'])
+        st.metric("参与站点总数", f"{len(all_stations_in)} 个")
+    with col_r4:
+        if cooperative_groups:
+            avg_sim = np.mean([g['avg_spectrum_similarity'] for g in cooperative_groups])
+            st.metric("平均频谱相似度", f"{avg_sim:.3f}")
+    
+    st.markdown("---")
+    
+    tab_map, tab_timeline, tab_table, tab_export = st.tabs([
+        "🗺️ 溯源地图", "⏱️ 事件时间轴", "📋 统计表格", "📤 导出GeoJSON"
+    ])
+    
+    with tab_map:
+        st.markdown("#### 🔵 监测站点 | 🔴 估计声源位置 | ---- 站点连线")
+        
+        center_lat = selected_stations['latitude'].mean()
+        center_lon = selected_stations['longitude'].mean()
+        
+        m = folium.Map(
+            location=[center_lat, center_lon],
+            zoom_start=13,
+            tiles='OpenStreetMap'
+        )
+        
+        for _, row in selected_stations.iterrows():
+            sid = row['station_id']
+            sname = row.get('station_name', sid)
+            popup_html = f"""
+            <b>{sname}</b><br>
+            编号: {sid}<br>
+            区域: {row.get('region', '未知')}
+            """
+            folium.Marker(
+                location=[row['latitude'], row['longitude']],
+                popup=folium.Popup(popup_html, max_width=300),
+                icon=folium.Icon(color='blue', icon='info-sign'),
+                tooltip=f"📍 {sname}"
+            ).add_to(m)
+        
+        station_coords = {}
+        for _, row in selected_stations.iterrows():
+            station_coords[row['station_id']] = (row['latitude'], row['longitude'])
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                s1 = station_ids[i]
+                s2 = station_ids[j]
+                if s1 in station_coords and s2 in station_coords:
+                    c1 = station_coords[s1]
+                    c2 = station_coords[s2]
+                    folium.PolyLine(
+                        [c1, c2],
+                        color='#888888',
+                        weight=1,
+                        opacity=0.6,
+                        dash_array='5, 5',
+                        tooltip=f"{s1} ↔ {s2}: {dist_matrix[i, j]:.0f}m / {delay_matrix[i, j]:.2f}s"
+                    ).add_to(m)
+        
+        group_colors = ['#E53935', '#D81B60', '#8E24AA', '#5E35B1',
+                        '#3949AB', '#1E88E5', '#00ACC1', '#00897B']
+        
+        for gi, group in enumerate(cooperative_groups):
+            gid = group['group_id']
+            loc = location_results.get(gid, {})
+            color = group_colors[gi % len(group_colors)]
+            
+            for hyp in loc.get('hyperbolas', []):
+                if hyp.get('points'):
+                    folium.PolyLine(
+                        hyp['points'],
+                        color=color,
+                        weight=2,
+                        opacity=0.5,
+                        dash_array='2, 4',
+                        tooltip=f"{gid} TDOA双曲线: {hyp['station_pair'][0]}→{hyp['station_pair'][1]}, Δd={hyp['delta_distance_m']:.0f}m"
+                    ).add_to(m)
+            
+            if loc.get('latitude') and loc.get('longitude'):
+                uncertainty = loc.get('uncertainty_m', 100)
+                folium.Circle(
+                    location=[loc['latitude'], loc['longitude']],
+                    radius=uncertainty,
+                    color=color,
+                    weight=2,
+                    fill=True,
+                    fill_color=color,
+                    fill_opacity=0.15,
+                    popup=f"""
+                    <b>{gid} 估计声源</b><br>
+                    方位角: {loc.get('bearing_deg', 'N/A')}°<br>
+                    距最早站: {loc.get('distance_from_earliest_m', 'N/A')}m<br>
+                    不确定度: {uncertainty:.0f}m<br>
+                    定位RMSE: {loc.get('rmse', 'N/A'):.1f}m<br>
+                    参与站点: {', '.join(group['participating_stations'])}
+                    """,
+                    tooltip=f"{gid} 声源 (±{uncertainty:.0f}m)"
+                ).add_to(m)
+                
+                folium.CircleMarker(
+                    location=[loc['latitude'], loc['longitude']],
+                    radius=8,
+                    color='white',
+                    weight=2,
+                    fill=True,
+                    fill_color=color,
+                    fill_opacity=1.0,
+                    popup=f"{gid} 声源中心点"
+                ).add_to(m)
+        
+        all_bounds = []
+        for _, row in selected_stations.iterrows():
+            all_bounds.append([row['latitude'], row['longitude']])
+        for loc in location_results.values():
+            if loc.get('latitude') and loc.get('longitude'):
+                all_bounds.append([loc['latitude'], loc['longitude']])
+        if all_bounds:
+            m.fit_bounds(all_bounds)
+        
+        st_folium(m, width='100%', height=600, returned_objects=[])
+    
+    with tab_timeline:
+        st.markdown("#### 协同事件组时间轴")
+        
+        groups_sorted = sorted(cooperative_groups, key=lambda g: g['earliest_time'])
+        
+        if groups_sorted:
+            t_min = groups_sorted[0]['earliest_time'] - timedelta(minutes=30)
+            t_max = groups_sorted[-1]['latest_time'] + timedelta(minutes=30)
+            
+            fig_tl, ax_tl = plt.subplots(figsize=(14, max(4, len(groups_sorted) * 0.8 + 2)))
+            
+            for gi, group in enumerate(groups_sorted):
+                gid = group['group_id']
+                color = group_colors[gi % len(group_colors)]
+                y_pos = len(groups_sorted) - gi - 1
+                
+                ax_tl.barh(
+                    y_pos,
+                    (group['latest_time'] - group['earliest_time']).total_seconds() / 60.0,
+                    left=(group['earliest_time'] - t_min).total_seconds() / 60.0,
+                    height=0.6,
+                    color=color,
+                    alpha=0.8,
+                    edgecolor='white',
+                    linewidth=1,
+                    label=gid
+                )
+                
+                for e in group['events']:
+                    e_start = (e['start_time'] - t_min).total_seconds() / 60.0
+                    e_dur = (e['end_time'] - e['start_time']).total_seconds() / 60.0
+                    ax_tl.barh(
+                        y_pos - 0.2,
+                        e_dur,
+                        left=e_start,
+                        height=0.15,
+                        color='#333333',
+                        alpha=0.6
+                    )
+                
+                ax_tl.text(
+                    (group['earliest_time'] - t_min).total_seconds() / 60.0 - 1,
+                    y_pos,
+                    f"{gid} ({len(group['participating_stations'])}站)",
+                    va='center',
+                    ha='right',
+                    fontsize=9,
+                    fontweight='bold'
+                )
+            
+            ax_tl.set_yticks(range(len(groups_sorted)))
+            y_labels = [g['earliest_time'].strftime('%H:%M') for g in reversed(groups_sorted)]
+            ax_tl.set_yticklabels(y_labels, fontsize=9)
+            ax_tl.set_xlabel(f"时间 (分钟, 起始于 {t_min.strftime('%Y-%m-%d %H:%M')})", fontsize=11)
+            ax_tl.set_title('协同事件组时间轴 (灰色小条=各站点独立事件)', fontsize=12, fontweight='bold')
+            ax_tl.grid(axis='x', alpha=0.3)
+            ax_tl.spines['top'].set_visible(False)
+            ax_tl.spines['right'].set_visible(False)
+            
+            fig_tl.tight_layout()
+            st.pyplot(fig_tl)
+            plt.close(fig_tl)
+        
+        st.markdown("---")
+        st.markdown("#### 点击事件组查看详情")
+        
+        selected_group = st.selectbox(
+            "选择协同事件组",
+            options=[g['group_id'] for g in groups_sorted],
+            format_func=lambda x: f"{x} - {next((g['earliest_time'].strftime('%Y-%m-%d %H:%M') for g in groups_sorted if g['group_id'] == x), x)}"
+        )
+        
+        if selected_group:
+            group = next(g for g in groups_sorted if g['group_id'] == selected_group)
+            loc = location_results.get(selected_group, {})
+            
+            col_d1, col_d2, col_d3, col_d4 = st.columns(4)
+            with col_d1:
+                st.metric("参与站点数", f"{len(group['participating_stations'])} 个")
+            with col_d2:
+                st.metric("最早触发站", group['earliest_station'])
+            with col_d3:
+                if loc.get('bearing_deg') is not None:
+                    st.metric("估计方位角", f"{loc['bearing_deg']:.1f}°")
+                else:
+                    st.metric("估计方位角", "N/A")
+            with col_d4:
+                if loc.get('distance_from_earliest_m') is not None:
+                    st.metric("估计距离", f"{loc['distance_from_earliest_m']:.0f} m")
+                else:
+                    st.metric("估计距离", "N/A")
+            
+            st.markdown("**各站点触发时间差 (相对最早站)**")
+            td_rows = []
+            for sid, td in sorted(group['time_diffs'].items(), key=lambda x: x[1]):
+                td_rows.append({
+                    '站点': sid,
+                    '到达时间差 (秒)': f"{td:.2f}",
+                    '对应距离差 (m)': f"{td * SOUND_SPEED:.0f}"
+                })
+            st.table(pd.DataFrame(td_rows))
+            
+            if loc.get('uncertainty_m') is not None:
+                st.caption(f"📍 定位不确定度: ±{loc['uncertainty_m']:.0f}m | 定位RMSE: {loc.get('rmse', 'N/A')}")
+    
+    with tab_table:
+        st.markdown("#### 协同事件组汇总统计表")
+        
+        table_rows = []
+        for group in groups_sorted:
+            gid = group['group_id']
+            loc = location_results.get(gid, {})
+            table_rows.append({
+                '组ID': gid,
+                '参与站点数': len(group['participating_stations']),
+                '最早触发站': group['earliest_station'],
+                '最早时间': group['earliest_time'].strftime('%Y-%m-%d %H:%M:%S'),
+                '持续时长 (min)': f"{(group['latest_time'] - group['earliest_time']).total_seconds() / 60:.1f}",
+                '平均峰值Leq (dB)': f"{group['avg_peak_leq']:.1f}",
+                '估计方位角 (°)': f"{loc['bearing_deg']:.1f}" if loc.get('bearing_deg') is not None else "N/A",
+                '估计距离 (m)': f"{loc['distance_from_earliest_m']:.0f}" if loc.get('distance_from_earliest_m') is not None else "N/A",
+                '定位不确定度 (m)': f"{loc['uncertainty_m']:.0f}" if loc.get('uncertainty_m') is not None else "N/A",
+                '频谱相似度均值': f"{group['avg_spectrum_similarity']:.3f}"
+            })
+        
+        result_df = pd.DataFrame(table_rows)
+        st.dataframe(result_df, use_container_width=True, hide_index=True, height=400)
+    
+    with tab_export:
+        st.markdown("#### 📤 导出溯源结果为GeoJSON")
+        st.info("导出的GeoJSON文件包含：估计声源位置点、不确定度圆、TDOA双曲线、监测站点位置，可直接在GIS软件中打开")
+        
+        geojson_data = export_traceability_geojson(
+            cooperative_groups, selected_stations, location_results
+        )
+        
+        geojson_str = json.dumps(geojson_data, ensure_ascii=False, indent=2)
+        
+        col_dl1, col_dl2 = st.columns([1, 2])
+        with col_dl1:
+            export_name = st.text_input("文件名", value=f"协同溯源结果_{datetime.now().strftime('%Y%m%d_%H%M')}")
+            st.download_button(
+                label="⬇️ 下载GeoJSON",
+                data=geojson_str,
+                file_name=f"{export_name}.geojson",
+                mime="application/geo+json",
+                type="primary",
+                use_container_width=True
+            )
+        with col_dl2:
+            st.metric("文件大小", f"{len(geojson_str.encode('utf-8')) / 1024:.1f} KB")
+            st.metric("要素数量", f"{len(geojson_data['features'])} 个")
+        
+        with st.expander("👀 预览GeoJSON内容", expanded=False):
+            st.code(geojson_str, language="json")
 
 
 if __name__ == '__main__':
