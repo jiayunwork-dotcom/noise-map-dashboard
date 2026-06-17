@@ -31,7 +31,7 @@ from zone_analysis import (
     process_uploaded_zones, evaluate_zone_compliance, zones_to_geojson_features,
     generate_compliance_summary, get_overall_compliance_stats
 )
-from time_analysis import get_station_time_analysis, calculate_hourly_pattern
+from time_analysis import get_station_time_analysis, calculate_hourly_pattern, detect_noise_events, get_event_statistics
 from spectrum_analysis import get_station_source_analysis, generate_source_recommendations
 from noise_prediction import predict_road_traffic_noise, generate_prediction_contour
 from report_generator import generate_report_pdf
@@ -70,7 +70,8 @@ def init_session_state():
         'grid_resolution': 50.0,
         'interpolation_done': False,
         'variogram_params': None,
-        'selected_time_filter': None
+        'selected_time_filter': None,
+        'event_threshold': 10.0
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -459,6 +460,15 @@ def render_interpolation_controls():
         )
     st.session_state.show_stations = st.sidebar.checkbox(
         "显示监测站点", value=st.session_state.show_stations, key='ctrl_showsta'
+    )
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 🚨 事件检测设置")
+    st.session_state.event_threshold = st.sidebar.slider(
+        "事件阈值 (dB)",
+        min_value=5, max_value=20, value=int(st.session_state.event_threshold),
+        step=1, key='ctrl_event_threshold',
+        help="Leq相对背景升高超过此阈值即标记为噪声事件"
     )
 
 
@@ -965,6 +975,140 @@ def page_zone_evaluation():
     st_folium(m, width='100%', height=500, returned_objects=[])
 
 
+def _render_noise_events_tab(measurements_df: pd.DataFrame, selected_station_id: str):
+    st.markdown("### 🚨 噪声事件检测")
+    st.caption(f"当前检测阈值: **{st.session_state.event_threshold} dB** (前后3小时滑动均值对比)")
+
+    with st.spinner("正在检测噪声事件..."):
+        events = detect_noise_events(
+            measurements_df,
+            threshold_db=float(st.session_state.event_threshold),
+            window_hours=3
+        )
+        event_stats = get_event_statistics(events)
+
+    col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+    with col_s1:
+        st.metric("总事件数", f"{event_stats['total_events']} 次")
+    with col_s2:
+        avg_dur = event_stats['avg_duration_minutes']
+        st.metric("平均持续时长", f"{avg_dur:.0f} 分钟" if avg_dur >= 60 else f"{avg_dur:.1f} 分钟")
+    with col_s3:
+        st.metric("最大峰值声级", f"{event_stats['max_peak_leq']:.1f} dB")
+    with col_s4:
+        mfh = event_stats['most_frequent_hour']
+        if mfh is not None:
+            st.metric("最常发生时段", f"{mfh:02d}:00 时段")
+        else:
+            st.metric("最常发生时段", "N/A")
+
+    st.markdown("---")
+
+    if not events:
+        st.info("未检测到符合阈值的噪声事件，可尝试降低检测阈值。")
+        return
+
+    st.markdown("#### 📊 事件散点图")
+    fig_e, ax_e = plt.subplots(figsize=(12, 5))
+
+    event_times = [e['start_time'] for e in events]
+    peak_leqs = [e['peak_leq'] for e in events]
+    durations = np.array([e['duration_minutes'] for e in events])
+    amplitudes = np.array([e['amplitude_db'] for e in events])
+
+    sizes = np.clip(durations * 2, 30, 500)
+
+    sc = ax_e.scatter(
+        event_times, peak_leqs,
+        s=sizes,
+        c=amplitudes,
+        cmap='YlOrRd',
+        vmin=st.session_state.event_threshold,
+        vmax=max(st.session_state.event_threshold + 5, amplitudes.max() if len(amplitudes) > 0 else st.session_state.event_threshold + 5),
+        alpha=0.8,
+        edgecolors='white',
+        linewidths=0.8,
+        zorder=3
+    )
+
+    cbar = plt.colorbar(sc, ax=ax_e, pad=0.01)
+    cbar.set_label('超标幅度 (dB)', fontsize=10)
+
+    ax_e.set_xlabel('时间', fontsize=11)
+    ax_e.set_ylabel('峰值声级 Leq [dB(A)]', fontsize=11)
+    ax_e.set_title(f'噪声事件分布 (共{len(events)}次)', fontsize=12, fontweight='bold')
+    ax_e.grid(alpha=0.3, zorder=0)
+    ax_e.spines['top'].set_visible(False)
+    ax_e.spines['right'].set_visible(False)
+
+    from matplotlib.lines import Line2D
+    legend_elements = [
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='#FFB74D',
+               markersize=8, label='短时长事件', markeredgecolor='white'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='#E64A19',
+               markersize=14, label='长时长事件', markeredgecolor='white')
+    ]
+    ax_e.legend(handles=legend_elements, loc='upper left', fontsize=9)
+
+    fig_e.autofmt_xdate()
+    fig_e.tight_layout()
+    st.pyplot(fig_e)
+    plt.close(fig_e)
+
+    st.markdown("---")
+    st.markdown(f"#### 📋 事件详情列表 (共 {len(events)} 条)")
+
+    rows = []
+    for idx, e in enumerate(events, 1):
+        dur_h = int(e['duration_minutes'] // 60)
+        dur_m = int(e['duration_minutes'] % 60)
+        if dur_h > 0:
+            dur_str = f"{dur_h}h{dur_m}min"
+        else:
+            dur_str = f"{dur_m}min"
+
+        rows.append({
+            '序号': idx,
+            '开始时间': e['start_time'].strftime('%Y-%m-%d %H:%M'),
+            '结束时间': e['end_time'].strftime('%Y-%m-%d %H:%M'),
+            '峰值(dB)': e['peak_leq'],
+            '背景(dB)': e['background_db'],
+            '超标(dB)': e['amplitude_db'],
+            '持续时长': dur_str,
+            '推测来源': f"{e.get('icon', '❓')} {e.get('source_name', '未知')}"
+        })
+
+    events_df = pd.DataFrame(rows)
+
+    def _highlight_amplitude(val):
+        try:
+            v = float(val)
+            if v >= 20:
+                return 'background-color: #ffebee; color: #c62828; font-weight: bold'
+            elif v >= 15:
+                return 'background-color: #fff3e0; color: #e65100; font-weight: bold'
+            elif v >= 10:
+                return 'background-color: #fffde7; color: #f57f17'
+        except Exception:
+            pass
+        return ''
+
+    styled = events_df.style.map(_highlight_amplitude, subset=['超标(dB)'])
+    st.dataframe(styled, use_container_width=True, height=400, hide_index=True)
+
+    with st.expander("🔍 查看各事件判定依据"):
+        for idx, e in enumerate(events, 1):
+            st.markdown(
+                f"**事件{idx}**: {e['start_time'].strftime('%m-%d %H:%M')} ~ "
+                f"{e['end_time'].strftime('%m-%d %H:%M')} | "
+                f"<span style='color:{e.get('color', '#999')};font-weight:bold;'>"
+                f"{e.get('icon', '❓')} {e.get('source_name', '未知')}</span>",
+                unsafe_allow_html=True
+            )
+            st.caption(f"  判定依据: {e.get('reason', '特征不明显')}")
+            st.markdown("")
+
+
 def page_time_analysis():
     st.header("📈 时间维度分析")
     
@@ -997,167 +1141,173 @@ def page_time_analysis():
     if measurements_df.empty:
         st.info("该站点暂无监测数据")
         return
-    
-    with st.spinner("正在进行时间维度分析..."):
-        analysis = get_station_time_analysis(measurements_df, selected_station_id)
-    
-    st.markdown("---")
-    st.subheader("📊 基础统计与昼夜等效声级")
-    
-    bs = analysis['basic_stats']
-    ldn_info = analysis['ldn']
-    
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("监测记录数", bs['total_records'])
-    with col2:
-        st.metric("监测时段", bs['date_range'])
-    with col3:
-        st.metric("Leq均值", f"{bs['leq_mean']:.1f} dB")
-    with col4:
-        if ldn_info.get('ldn'):
-            st.metric("Ldn昼夜等效", f"{ldn_info['ldn']:.1f} dB")
-    
-    col5, col6, col7, col8 = st.columns(4)
-    with col5:
-        if ldn_info.get('ld'):
-            st.metric("☀️ 昼间Ld", f"{ldn_info['ld']:.1f} dB", f"{ldn_info['day_count']}条")
-    with col6:
-        if ldn_info.get('ln'):
-            st.metric("🌙 夜间Ln", f"{ldn_info['ln']:.1f} dB", f"{ldn_info['night_count']}条")
-    with col7:
-        st.metric("Leq最大", f"{bs['leq_max']:.1f} dB")
-    with col8:
-        st.metric("Leq标准差", f"{bs['leq_std']:.1f} dB")
-    
-    st.markdown("---")
-    
-    weekly = analysis['weekly']
-    hourly, peak_hours = analysis['hourly'], analysis['peak_hours']
-    monthly, monthly_trend = analysis['monthly'], analysis['monthly_trend']
-    
-    col_a, col_b = st.columns(2)
-    
-    with col_a:
-        st.subheader("📅 一周变化模式")
-        if weekly is not None and not weekly.empty:
-            fig_w, ax_w = plt.subplots(figsize=(8, 4.5))
-            weekdays = weekly['weekday_name'].values
-            means = weekly['mean'].values
-            colors_w = ['#2196F3'] * 5 + ['#4CAF50'] * 2
-            colors_w = colors_w[:len(weekdays)]
-            
-            bars = ax_w.bar(range(len(weekdays)), means, color=colors_w,
-                          edgecolor='white', linewidth=0.5, alpha=0.9)
-            ax_w.set_xticks(range(len(weekdays)))
-            ax_w.set_xticklabels(weekdays, fontsize=10)
-            ax_w.set_ylabel('平均 Leq [dB(A)]', fontsize=11)
-            ax_w.set_title('各工作日平均Leq对比', fontsize=12, fontweight='bold')
-            
-            overall_m = np.mean(means)
-            ax_w.axhline(y=overall_m, color='#FF5722', linestyle='--', linewidth=1.2,
-                        alpha=0.8, label=f'周均值 {overall_m:.1f}dB')
-            ax_w.legend(fontsize=9)
-            
-            for bar, m_val in zip(bars, means):
-                ax_w.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
-                         f'{m_val:.1f}', ha='center', fontsize=9, fontweight='bold')
-            
-            ax_w.spines['top'].set_visible(False)
-            ax_w.spines['right'].set_visible(False)
-            ax_w.grid(axis='y', alpha=0.3)
-            fig_w.tight_layout()
-            st.pyplot(fig_w)
-            plt.close(fig_w)
-        else:
-            st.info("数据不足以分析周变化")
-    
-    with col_b:
-        st.subheader("⏰ 24小时变化曲线")
-        if hourly is not None and not hourly.empty:
-            fig_h, ax_h = plt.subplots(figsize=(8, 4.5))
-            hours = hourly['hour'].values
-            means = hourly['mean'].values
-            
-            ax_h.plot(hours, means, 'o-', color='#1976D2', linewidth=2.2, markersize=6,
-                     markerfacecolor='white', markeredgewidth=2, label='平均Leq')
-            
-            if peak_hours:
-                peak_h_arr = hours[np.isin(hours, peak_hours)]
-                peak_m_arr = means[np.isin(hours, peak_hours)]
-                ax_h.scatter(peak_h_arr, peak_m_arr, s=150, color='#F44336', marker='*', zorder=5,
-                            label=f'高峰时段 ({len(peak_hours)}h)')
-            
-            daily_mean_col = hourly.get('daily_mean', pd.Series([np.mean(means)] * len(hourly)))
-            threshold_col = hourly.get('threshold', pd.Series([np.mean(means) + 5] * len(hourly)))
-            daily_mean = float(daily_mean_col.iloc[0])
-            threshold = float(threshold_col.iloc[0])
-            
-            ax_h.axhline(y=daily_mean, color='#4CAF50', linestyle='--', linewidth=1,
-                        alpha=0.8, label=f'日均值 {daily_mean:.1f}dB')
-            ax_h.axhline(y=threshold, color='#FF9800', linestyle=':', linewidth=1,
-                        alpha=0.8, label=f'阈值 {threshold:.1f}dB')
-            
-            ax_h.fill_between(hours, means, alpha=0.12, color='#1976D2')
-            ax_h.set_xticks(range(0, 24, 2))
-            ax_h.set_xlabel('时刻 (小时)', fontsize=11)
-            ax_h.set_ylabel('平均 Leq [dB(A)]', fontsize=11)
-            ax_h.set_title('24小时噪声变化规律', fontsize=12, fontweight='bold')
-            ax_h.legend(fontsize=9, loc='upper left')
-            ax_h.spines['top'].set_visible(False)
-            ax_h.spines['right'].set_visible(False)
-            ax_h.grid(axis='y', alpha=0.3)
-            fig_h.tight_layout()
-            st.pyplot(fig_h)
-            plt.close(fig_h)
-        else:
-            st.info("数据不足以分析24小时变化")
-    
-    st.markdown("---")
-    st.subheader("📉 月度趋势分析")
-    
-    if monthly is not None and not monthly.empty:
-        fig_m, ax_m = plt.subplots(figsize=(10, 4.5))
-        labels = monthly['year_month_str'].values
-        means_m = monthly['mean'].values
-        x = np.arange(len(labels))
+
+    tab_pattern, tab_events = st.tabs(["📊 时序变化模式", "🚨 噪声事件检测"])
+
+    with tab_pattern:
+        with st.spinner("正在进行时间维度分析..."):
+            analysis = get_station_time_analysis(measurements_df, selected_station_id)
         
-        ax_m.plot(x, means_m, 'o-', color='#7B1FA2', linewidth=2, markersize=7,
-                 markerfacecolor='white', markeredgewidth=2, label='月均Leq')
+        st.markdown("---")
+        st.subheader("📊 基础统计与昼夜等效声级")
         
-        if monthly_trend.get('predicted') and len(monthly_trend['predicted']) == len(x):
-            tc = monthly_trend.get('trend_color', '#666')
-            tt = monthly_trend.get('trend', '')
-            ax_m.plot(x, monthly_trend['predicted'], '--', color=tc, linewidth=1.8,
-                     label=f'趋势线 ({tt})')
+        bs = analysis['basic_stats']
+        ldn_info = analysis['ldn']
         
-        ax_m.set_xticks(x)
-        ax_m.set_xticklabels(labels, rotation=45, ha='right', fontsize=9)
-        ax_m.set_ylabel('月均 Leq [dB(A)]', fontsize=11)
-        ax_m.set_title('月度噪声变化趋势', fontsize=12, fontweight='bold')
-        ax_m.legend(fontsize=9)
-        ax_m.grid(axis='y', alpha=0.3)
-        ax_m.spines['top'].set_visible(False)
-        ax_m.spines['right'].set_visible(False)
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("监测记录数", bs['total_records'])
+        with col2:
+            st.metric("监测时段", bs['date_range'])
+        with col3:
+            st.metric("Leq均值", f"{bs['leq_mean']:.1f} dB")
+        with col4:
+            if ldn_info.get('ldn'):
+                st.metric("Ldn昼夜等效", f"{ldn_info['ldn']:.1f} dB")
         
-        if 'monthly_change_dB' in monthly_trend:
-            change = monthly_trend['monthly_change_dB']
-            if abs(change) >= 0.05:
-                direction = '恶化(上升)' if change > 0 else '改善(下降)'
+        col5, col6, col7, col8 = st.columns(4)
+        with col5:
+            if ldn_info.get('ld'):
+                st.metric("☀️ 昼间Ld", f"{ldn_info['ld']:.1f} dB", f"{ldn_info['day_count']}条")
+        with col6:
+            if ldn_info.get('ln'):
+                st.metric("🌙 夜间Ln", f"{ldn_info['ln']:.1f} dB", f"{ldn_info['night_count']}条")
+        with col7:
+            st.metric("Leq最大", f"{bs['leq_max']:.1f} dB")
+        with col8:
+            st.metric("Leq标准差", f"{bs['leq_std']:.1f} dB")
+        
+        st.markdown("---")
+        
+        weekly = analysis['weekly']
+        hourly, peak_hours = analysis['hourly'], analysis['peak_hours']
+        monthly, monthly_trend = analysis['monthly'], analysis['monthly_trend']
+        
+        col_a, col_b = st.columns(2)
+        
+        with col_a:
+            st.subheader("📅 一周变化模式")
+            if weekly is not None and not weekly.empty:
+                fig_w, ax_w = plt.subplots(figsize=(8, 4.5))
+                weekdays = weekly['weekday_name'].values
+                means = weekly['mean'].values
+                colors_w = ['#2196F3'] * 5 + ['#4CAF50'] * 2
+                colors_w = colors_w[:len(weekdays)]
+                
+                bars = ax_w.bar(range(len(weekdays)), means, color=colors_w,
+                              edgecolor='white', linewidth=0.5, alpha=0.9)
+                ax_w.set_xticks(range(len(weekdays)))
+                ax_w.set_xticklabels(weekdays, fontsize=10)
+                ax_w.set_ylabel('平均 Leq [dB(A)]', fontsize=11)
+                ax_w.set_title('各工作日平均Leq对比', fontsize=12, fontweight='bold')
+                
+                overall_m = np.mean(means)
+                ax_w.axhline(y=overall_m, color='#FF5722', linestyle='--', linewidth=1.2,
+                            alpha=0.8, label=f'周均值 {overall_m:.1f}dB')
+                ax_w.legend(fontsize=9)
+                
+                for bar, m_val in zip(bars, means):
+                    ax_w.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
+                             f'{m_val:.1f}', ha='center', fontsize=9, fontweight='bold')
+                
+                ax_w.spines['top'].set_visible(False)
+                ax_w.spines['right'].set_visible(False)
+                ax_w.grid(axis='y', alpha=0.3)
+                fig_w.tight_layout()
+                st.pyplot(fig_w)
+                plt.close(fig_w)
+            else:
+                st.info("数据不足以分析周变化")
+        
+        with col_b:
+            st.subheader("⏰ 24小时变化曲线")
+            if hourly is not None and not hourly.empty:
+                fig_h, ax_h = plt.subplots(figsize=(8, 4.5))
+                hours = hourly['hour'].values
+                means = hourly['mean'].values
+                
+                ax_h.plot(hours, means, 'o-', color='#1976D2', linewidth=2.2, markersize=6,
+                         markerfacecolor='white', markeredgewidth=2, label='平均Leq')
+                
+                if peak_hours:
+                    peak_h_arr = hours[np.isin(hours, peak_hours)]
+                    peak_m_arr = means[np.isin(hours, peak_hours)]
+                    ax_h.scatter(peak_h_arr, peak_m_arr, s=150, color='#F44336', marker='*', zorder=5,
+                                label=f'高峰时段 ({len(peak_hours)}h)')
+                
+                daily_mean_col = hourly.get('daily_mean', pd.Series([np.mean(means)] * len(hourly)))
+                threshold_col = hourly.get('threshold', pd.Series([np.mean(means) + 5] * len(hourly)))
+                daily_mean = float(daily_mean_col.iloc[0])
+                threshold = float(threshold_col.iloc[0])
+                
+                ax_h.axhline(y=daily_mean, color='#4CAF50', linestyle='--', linewidth=1,
+                            alpha=0.8, label=f'日均值 {daily_mean:.1f}dB')
+                ax_h.axhline(y=threshold, color='#FF9800', linestyle=':', linewidth=1,
+                            alpha=0.8, label=f'阈值 {threshold:.1f}dB')
+                
+                ax_h.fill_between(hours, means, alpha=0.12, color='#1976D2')
+                ax_h.set_xticks(range(0, 24, 2))
+                ax_h.set_xlabel('时刻 (小时)', fontsize=11)
+                ax_h.set_ylabel('平均 Leq [dB(A)]', fontsize=11)
+                ax_h.set_title('24小时噪声变化规律', fontsize=12, fontweight='bold')
+                ax_h.legend(fontsize=9, loc='upper left')
+                ax_h.spines['top'].set_visible(False)
+                ax_h.spines['right'].set_visible(False)
+                ax_h.grid(axis='y', alpha=0.3)
+                fig_h.tight_layout()
+                st.pyplot(fig_h)
+                plt.close(fig_h)
+            else:
+                st.info("数据不足以分析24小时变化")
+        
+        st.markdown("---")
+        st.subheader("📉 月度趋势分析")
+        
+        if monthly is not None and not monthly.empty:
+            fig_m, ax_m = plt.subplots(figsize=(10, 4.5))
+            labels = monthly['year_month_str'].values
+            means_m = monthly['mean'].values
+            x = np.arange(len(labels))
+            
+            ax_m.plot(x, means_m, 'o-', color='#7B1FA2', linewidth=2, markersize=7,
+                     markerfacecolor='white', markeredgewidth=2, label='月均Leq')
+            
+            if monthly_trend.get('predicted') and len(monthly_trend['predicted']) == len(x):
                 tc = monthly_trend.get('trend_color', '#666')
-                ax_m.text(0.02, 0.98, f'月变化率: {change:+.2f} dB/月\n{direction}',
-                         transform=ax_m.transAxes, fontsize=10, va='top',
-                         bbox=dict(boxstyle='round,pad=0.5', facecolor=tc, alpha=0.25))
-        
-        fig_m.tight_layout()
-        st.pyplot(fig_m)
-        plt.close(fig_m)
-        
-        t_info = monthly_trend.get('trend', 'N/A')
-        r2 = monthly_trend.get('r_squared', 0)
-        st.caption(f"趋势判定: **{t_info}** | 线性回归R²: {r2:.3f}")
-    else:
-        st.info("数据不足以分析月度趋势(至少需要3个月数据)")
+                tt = monthly_trend.get('trend', '')
+                ax_m.plot(x, monthly_trend['predicted'], '--', color=tc, linewidth=1.8,
+                         label=f'趋势线 ({tt})')
+            
+            ax_m.set_xticks(x)
+            ax_m.set_xticklabels(labels, rotation=45, ha='right', fontsize=9)
+            ax_m.set_ylabel('月均 Leq [dB(A)]', fontsize=11)
+            ax_m.set_title('月度噪声变化趋势', fontsize=12, fontweight='bold')
+            ax_m.legend(fontsize=9)
+            ax_m.grid(axis='y', alpha=0.3)
+            ax_m.spines['top'].set_visible(False)
+            ax_m.spines['right'].set_visible(False)
+            
+            if 'monthly_change_dB' in monthly_trend:
+                change = monthly_trend['monthly_change_dB']
+                if abs(change) >= 0.05:
+                    direction = '恶化(上升)' if change > 0 else '改善(下降)'
+                    tc = monthly_trend.get('trend_color', '#666')
+                    ax_m.text(0.02, 0.98, f'月变化率: {change:+.2f} dB/月\n{direction}',
+                             transform=ax_m.transAxes, fontsize=10, va='top',
+                             bbox=dict(boxstyle='round,pad=0.5', facecolor=tc, alpha=0.25))
+            
+            fig_m.tight_layout()
+            st.pyplot(fig_m)
+            plt.close(fig_m)
+            
+            t_info = monthly_trend.get('trend', 'N/A')
+            r2 = monthly_trend.get('r_squared', 0)
+            st.caption(f"趋势判定: **{t_info}** | 线性回归R²: {r2:.3f}")
+        else:
+            st.info("数据不足以分析月度趋势(至少需要3个月数据)")
+
+    with tab_events:
+        _render_noise_events_tab(measurements_df, selected_station_id)
 
 
 def page_source_identification():

@@ -1,7 +1,8 @@
 import numpy as np
 import pandas as pd
 from typing import Dict, Tuple, Optional, List
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
+import ast
 
 
 DAY_START_HOUR = 6
@@ -300,3 +301,331 @@ def get_station_time_analysis(df: pd.DataFrame, station_name: str = '') -> Dict:
     results['quarterly'], results['quarterly_trend'] = calculate_quarterly_trend(df)
     
     return results
+
+
+def _infer_event_source(event: Dict, measurements_df: pd.DataFrame) -> Dict:
+    start_hour = event['start_time'].hour
+    duration_min = event['duration_minutes']
+    amplitude = event['amplitude_db']
+
+    spectrum_strs = measurements_df[
+        (measurements_df['measurement_time'] >= event['start_time']) &
+        (measurements_df['measurement_time'] <= event['end_time'])
+    ]['spectrum'].dropna().tolist()
+
+    low_mid_energy = 0
+    mid_energy = 0
+    mid_high_energy = 0
+    has_spectrum = False
+
+    from data_models import FREQUENCY_BANDS
+    for spec_str in spectrum_strs[:5]:
+        try:
+            spec_dict = ast.literal_eval(spec_str) if isinstance(spec_str, str) else spec_dict
+            if isinstance(spec_dict, dict):
+                for freq, val in spec_dict.items():
+                    freq_int = int(freq)
+                    energy = 10 ** (float(val) / 10)
+                    if 63 <= freq_int <= 500:
+                        low_mid_energy += energy
+                    elif 250 <= freq_int <= 1000:
+                        mid_energy += energy
+                    elif 1000 <= freq_int <= 4000:
+                        mid_high_energy += energy
+                has_spectrum = True
+        except Exception:
+            continue
+
+    is_traffic_peak = (7 <= start_hour <= 9) or (17 <= start_hour <= 20)
+    is_night = (start_hour >= 22) or (start_hour <= 5)
+
+    if has_spectrum:
+        total = low_mid_energy + mid_energy + mid_high_energy
+        if total > 0:
+            low_mid_ratio = low_mid_energy / total
+            mid_ratio = mid_energy / total
+            mid_high_ratio = mid_high_energy / total
+        else:
+            low_mid_ratio = mid_ratio = mid_high_ratio = 0.33
+    else:
+        low_mid_ratio = mid_ratio = mid_high_ratio = 0.33
+
+    if is_night and amplitude > 15 and duration_min <= 60:
+        return {
+            'source': 'construction',
+            'source_name': '施工/突发噪声',
+            'icon': '🏗️',
+            'color': '#9C27B0',
+            'reason': '夜间短时高声级脉冲，符合施工或突发噪声特征'
+        }
+    elif is_traffic_peak and low_mid_ratio > 0.4:
+        return {
+            'source': 'traffic',
+            'source_name': '交通噪声',
+            'icon': '🚗',
+            'color': '#FF9800',
+            'reason': '发生在交通高峰时段，低频成分突出'
+        }
+    elif duration_min >= 120 and amplitude < 20 and mid_ratio > 0.35:
+        return {
+            'source': 'industrial',
+            'source_name': '工业噪声',
+            'icon': '🏭',
+            'color': '#607D8B',
+            'reason': '持续时间较长且声级稳定，符合工业噪声特征'
+        }
+    elif mid_high_ratio > 0.4:
+        return {
+            'source': 'life',
+            'source_name': '生活噪声',
+            'icon': '👥',
+            'color': '#4CAF50',
+            'reason': '中高频成分突出，推测为社会生活噪声'
+        }
+    else:
+        return {
+            'source': 'unknown',
+            'source_name': '待判定',
+            'icon': '❓',
+            'color': '#9E9E9E',
+            'reason': '特征不明显，建议结合现场踏勘确认'
+        }
+
+
+def detect_noise_events(df: pd.DataFrame, threshold_db: float = 10.0,
+                        window_hours: int = 3) -> List[Dict]:
+    if df.empty or len(df) < 10:
+        return []
+
+    df_sorted = df.sort_values('measurement_time').copy()
+    df_sorted = df_sorted.reset_index(drop=True)
+
+    times = df_sorted['measurement_time'].values
+    leq_vals = df_sorted['leq'].values.astype(float)
+    n = len(df_sorted)
+    if n < 7:
+        return []
+
+    time_deltas = []
+    for i in range(1, min(n, 20)):
+        dt = (pd.Timestamp(times[i]) - pd.Timestamp(times[i - 1])).total_seconds() / 60.0
+        if dt > 0:
+            time_deltas.append(dt)
+    avg_interval = float(np.median(time_deltas)) if time_deltas else 60.0
+
+    valid_leq = leq_vals[~np.isnan(leq_vals)]
+    global_median = float(np.median(valid_leq)) if len(valid_leq) > 0 else 50.0
+    global_p25 = float(np.percentile(valid_leq, 25)) if len(valid_leq) > 0 else 50.0
+
+    background = np.full(n, np.nan)
+
+    for i in range(n):
+        if np.isnan(leq_vals[i]):
+            continue
+
+        t_center = pd.Timestamp(times[i])
+        t_far_before = t_center - pd.Timedelta(hours=window_hours * 3)
+        t_before = t_center - pd.Timedelta(hours=window_hours)
+        t_after = t_center + pd.Timedelta(hours=window_hours)
+        t_far_after = t_center + pd.Timedelta(hours=window_hours * 3)
+
+        far_before_vals = []
+        far_after_vals = []
+        near_vals = []
+
+        for j in range(n):
+            if j == i:
+                continue
+            tj = pd.Timestamp(times[j])
+            if np.isnan(leq_vals[j]):
+                continue
+            if t_far_before <= tj < t_before:
+                far_before_vals.append(leq_vals[j])
+            elif t_after < tj <= t_far_after:
+                far_after_vals.append(leq_vals[j])
+            elif t_before <= tj <= t_after:
+                near_vals.append(leq_vals[j])
+
+        candidates = []
+        if len(far_before_vals) >= 2:
+            candidates.append(float(np.percentile(far_before_vals, 35)))
+        if len(far_after_vals) >= 2:
+            candidates.append(float(np.percentile(far_after_vals, 35)))
+
+        if len(candidates) == 0:
+            if len(near_vals) >= 5:
+                near_sorted = sorted(near_vals)
+                lower_half = near_sorted[:len(near_sorted) // 2]
+                candidates.append(float(np.mean(lower_half)))
+
+        if len(candidates) > 0:
+            background[i] = float(np.mean(candidates))
+
+    fallback_bg = min(global_median, global_p25 + 3)
+    for i in range(n):
+        if np.isnan(background[i]):
+            background[i] = fallback_bg
+
+    exceed_mask = np.zeros(n, dtype=bool)
+    for i in range(n):
+        if not np.isnan(leq_vals[i]) and not np.isnan(background[i]):
+            if leq_vals[i] - background[i] >= threshold_db:
+                exceed_mask[i] = True
+
+    gap_tolerance = max(1, int(round(60.0 / avg_interval)))
+    events = []
+    in_event = False
+    event_start_idx = None
+    event_indices = []
+    gap_counter = 0
+
+    for i in range(n):
+        if exceed_mask[i]:
+            gap_counter = 0
+            if not in_event:
+                in_event = True
+                event_start_idx = i
+                event_indices = []
+            event_indices.append(i)
+        else:
+            if in_event:
+                gap_counter += 1
+                if gap_counter <= gap_tolerance and not np.isnan(leq_vals[i]):
+                    if leq_vals[i] - background[i] >= threshold_db * 0.6:
+                        event_indices.append(i)
+                    else:
+                        pass
+                else:
+                    if event_start_idx is not None and len(event_indices) >= 1:
+                        start_idx = event_indices[0]
+                        end_idx = event_indices[-1]
+                        start_time = pd.Timestamp(times[start_idx])
+                        end_time = pd.Timestamp(times[end_idx])
+                        duration = (end_time - start_time).total_seconds() / 60.0
+                        if duration <= 0:
+                            duration = avg_interval
+
+                        event_leq_vals = leq_vals[event_indices]
+                        event_bg_vals = background[event_indices]
+                        valid_leq_in = event_leq_vals[~np.isnan(event_leq_vals)]
+                        valid_bg_in = event_bg_vals[~np.isnan(event_bg_vals)]
+
+                        if len(valid_leq_in) > 0:
+                            peak_leq = float(np.max(valid_leq_in))
+                        else:
+                            peak_leq = float(leq_vals[start_idx])
+                        if len(valid_bg_in) > 0:
+                            mean_bg = float(np.mean(valid_bg_in))
+                        else:
+                            mean_bg = float(background[start_idx])
+                        amplitude = float(peak_leq - mean_bg)
+
+                        if amplitude >= threshold_db * 0.85:
+                            events.append({
+                                'start_time': start_time,
+                                'end_time': end_time,
+                                'peak_leq': round(peak_leq, 1),
+                                'duration_minutes': round(duration, 1),
+                                'background_db': round(mean_bg, 1),
+                                'amplitude_db': round(amplitude, 1),
+                                'start_idx': start_idx,
+                                'end_idx': end_idx
+                            })
+                    in_event = False
+                    event_start_idx = None
+                    event_indices = []
+                    gap_counter = 0
+
+    if in_event and event_start_idx is not None and len(event_indices) >= 1:
+        start_idx = event_indices[0]
+        end_idx = event_indices[-1]
+        start_time = pd.Timestamp(times[start_idx])
+        end_time = pd.Timestamp(times[end_idx])
+        duration = (end_time - start_time).total_seconds() / 60.0
+        if duration <= 0:
+            duration = avg_interval
+
+        event_leq_vals = leq_vals[event_indices]
+        event_bg_vals = background[event_indices]
+        valid_leq_in = event_leq_vals[~np.isnan(event_leq_vals)]
+        valid_bg_in = event_bg_vals[~np.isnan(event_bg_vals)]
+
+        if len(valid_leq_in) > 0:
+            peak_leq = float(np.max(valid_leq_in))
+        else:
+            peak_leq = float(leq_vals[start_idx])
+        if len(valid_bg_in) > 0:
+            mean_bg = float(np.mean(valid_bg_in))
+        else:
+            mean_bg = float(background[start_idx])
+        amplitude = float(peak_leq - mean_bg)
+
+        if amplitude >= threshold_db * 0.85:
+            events.append({
+                'start_time': start_time,
+                'end_time': end_time,
+                'peak_leq': round(peak_leq, 1),
+                'duration_minutes': round(duration, 1),
+                'background_db': round(mean_bg, 1),
+                'amplitude_db': round(amplitude, 1),
+                'start_idx': start_idx,
+                'end_idx': end_idx
+            })
+
+    merged_events = []
+    for event in events:
+        if not merged_events:
+            merged_events.append(event)
+        else:
+            last = merged_events[-1]
+            gap_between = (event['start_time'] - last['end_time']).total_seconds() / 60.0
+            if gap_between <= avg_interval * 3:
+                all_peaks = [last['peak_leq'], event['peak_leq']]
+                all_bgs = [last['background_db'], event['background_db']]
+                merged_events[-1] = {
+                    'start_time': last['start_time'],
+                    'end_time': event['end_time'],
+                    'peak_leq': round(float(max(all_peaks)), 1),
+                    'duration_minutes': round((event['end_time'] - last['start_time']).total_seconds() / 60.0, 1),
+                    'background_db': round(float(np.mean(all_bgs)), 1),
+                    'amplitude_db': round(float(max(all_peaks) - np.mean(all_bgs)), 1),
+                    'start_idx': last['start_idx'],
+                    'end_idx': event['end_idx']
+                }
+            else:
+                merged_events.append(event)
+
+    for event in merged_events:
+        source_info = _infer_event_source(event, df_sorted)
+        event.update(source_info)
+
+    return merged_events
+
+
+def get_event_statistics(events: List[Dict]) -> Dict:
+    if not events:
+        return {
+            'total_events': 0,
+            'avg_duration_minutes': 0,
+            'max_peak_leq': 0,
+            'most_frequent_hour': None,
+            'hour_distribution': {}
+        }
+
+    durations = [e['duration_minutes'] for e in events]
+    peaks = [e['peak_leq'] for e in events]
+
+    hour_counts = {}
+    for e in events:
+        h = e['start_time'].hour
+        hour_counts[h] = hour_counts.get(h, 0) + 1
+
+    most_freq_hour = max(hour_counts, key=hour_counts.get) if hour_counts else None
+
+    return {
+        'total_events': len(events),
+        'avg_duration_minutes': round(np.mean(durations), 1),
+        'max_peak_leq': round(np.max(peaks), 1),
+        'most_frequent_hour': most_freq_hour,
+        'hour_distribution': hour_counts
+    }
