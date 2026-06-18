@@ -2433,11 +2433,20 @@ def page_cooperative_tracing():
                 comparison_data = compute_comparison_data(
                     compare_selected, groups_sorted, location_results, group_color_map
                 )
+                st.session_state.coop_comparison_data = comparison_data
+                st.session_state.coop_compare_selected = compare_selected
+                
+                all_have_uncertainty = all(d['uncertainty'] is not None for d in comparison_data)
+                none_have_uncertainty = all(d['uncertainty'] is None for d in comparison_data)
                 
                 st.markdown("---")
                 st.markdown("##### 📊 多组对比分析面板")
                 
-                radar_categories = ['参与站点数', '持续时长', '平均峰值Leq', '频谱相似度', '定位不确定度']
+                radar_categories_full = ['参与站点数', '持续时长', '平均峰值Leq', '频谱相似度', '定位不确定度']
+                radar_categories = ['参与站点数', '持续时长', '平均峰值Leq', '频谱相似度']
+                if all_have_uncertainty:
+                    radar_categories = radar_categories_full
+                
                 num_vars = len(radar_categories)
                 
                 radar_fig = go.Figure()
@@ -2452,23 +2461,32 @@ def page_cooperative_tracing():
                         d['norm_duration'],
                         d['norm_leq'],
                         d['norm_sim'],
-                        d['norm_precision_for_radar']
                     ]
+                    if all_have_uncertainty:
+                        values.append(d['norm_precision_for_radar'])
                     values += values[:1]
                     
                     angles = [n / float(num_vars) * 2 * 3.14159 for n in range(num_vars)]
                     angles += angles[:1]
                     
+                    legend_name = gid
+                    if none_have_uncertainty:
+                        legend_name = f"{gid} (无定位数据)"
+                    
                     radar_fig.add_trace(go.Scatterpolar(
                         r=values,
                         theta=radar_categories + [radar_categories[0]],
                         fill='toself',
-                        name=gid,
+                        name=legend_name,
                         line=dict(color=d['color'], width=line_width),
                         marker=dict(size=6, color=d['color']),
                         opacity=0.8,
                         customdata=[gid]
                     ))
+                
+                radar_title = '多维度对比雷达图'
+                if none_have_uncertainty:
+                    radar_title = '多维度对比雷达图（无定位不确定度数据）'
                 
                 radar_fig.update_layout(
                     polar=dict(
@@ -2486,17 +2504,19 @@ def page_cooperative_tracing():
                     legend=dict(
                         orientation="h",
                         yanchor="bottom",
-                        y=-0.1,
+                        y=-0.15,
                         xanchor="center",
                         x=0.5
                     ),
                     height=450,
-                    margin=dict(l=20, r=20, t=30, b=80),
+                    margin=dict(l=20, r=20, t=30, b=100),
                     title=dict(
-                        text='多维度对比雷达图',
+                        text=radar_title,
                         font=dict(size=14)
                     )
                 )
+                
+                st.session_state.coop_radar_fig_json = radar_fig.to_json()
                 
                 col_radar, col_table = st.columns([1, 1])
                 
@@ -2507,6 +2527,8 @@ def page_cooperative_tracing():
                         on_select="rerun",
                         use_container_width=True
                     )
+                    if none_have_uncertainty:
+                        st.info("ℹ️ 所选事件组均为2站组，无精确定位数据，雷达图暂不包含\"定位不确定度\"维度")
                 
                 with col_table:
                     st.markdown("**对比数据表格**")
@@ -2560,47 +2582,53 @@ def page_cooperative_tracing():
                     try:
                         import plotly.io as pio
                         
-                        def _generate_pdf():
-                            try:
-                                radar_bytes = pio.to_image(
-                                    radar_fig, format='png', 
-                                    width=800, height=600, scale=2,
-                                    engine='kaleido'
-                                )
-                                
-                                pdf_comparison_data = []
-                                for d in comparison_data:
-                                    d_copy = dict(d)
-                                    d_copy['highlighted'] = (d['group_id'] == st.session_state.coop_selected_group)
-                                    pdf_comparison_data.append(d_copy)
-                                
-                                pdf_colors = {d['group_id']: d['color'] for d in comparison_data}
-                                
-                                pdf_bytes = generate_comparison_report_pdf(
-                                    pdf_comparison_data,
-                                    pdf_colors,
-                                    radar_bytes
-                                )
-                                
-                                gids_str = "_".join(compare_selected)
-                                st.session_state.coop_pdf_data = {
-                                    'bytes': pdf_bytes,
-                                    'filename': f"协同事件组对比报告_{gids_str}_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
-                                }
-                            except Exception as e:
-                                st.session_state.coop_pdf_error = str(e)
+                        prev_selected = st.session_state.get('coop_prev_pdf_groups', [])
+                        if prev_selected != compare_selected:
+                            st.session_state.coop_pdf_data = None
+                            st.session_state.coop_pdf_error = None
+                            st.session_state.coop_prev_pdf_groups = list(compare_selected)
                         
                         if st.button(
                             "📄 导出对比报告PDF", 
                             type="primary", 
                             key="export_compare_report_btn",
-                            use_container_width=True,
-                            on_click=_generate_pdf
+                            use_container_width=True
                         ):
-                            pass
+                            try:
+                                with st.spinner("正在生成雷达图截图..."):
+                                    radar_bytes = pio.to_image(
+                                        radar_fig, format='png', 
+                                        width=800, height=600, scale=2
+                                    )
+                                
+                                with st.spinner("正在生成PDF报告..."):
+                                    pdf_comparison_data = []
+                                    for d in comparison_data:
+                                        d_copy = dict(d)
+                                        d_copy['highlighted'] = (d['group_id'] == st.session_state.coop_selected_group)
+                                        pdf_comparison_data.append(d_copy)
+                                    
+                                    pdf_colors = {d['group_id']: d['color'] for d in comparison_data}
+                                    
+                                    pdf_bytes = generate_comparison_report_pdf(
+                                        pdf_comparison_data,
+                                        pdf_colors,
+                                        radar_bytes
+                                    )
+                                    
+                                    gids_str = "_".join(compare_selected)
+                                    st.session_state.coop_pdf_data = {
+                                        'bytes': pdf_bytes,
+                                        'filename': f"协同事件组对比报告_{gids_str}_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
+                                    }
+                                    st.session_state.coop_pdf_error = None
+                            except Exception as e:
+                                st.session_state.coop_pdf_error = f"PDF生成失败: {str(e)}"
+                                st.session_state.coop_pdf_data = None
                         
-                        if 'coop_pdf_data' in st.session_state and st.session_state.coop_pdf_data:
+                        if st.session_state.get('coop_pdf_data'):
                             pdf_data = st.session_state.coop_pdf_data
+                            st.success("✅ 报告已生成，可以下载了！")
                             st.download_button(
                                 label="⬇️ 下载对比报告",
                                 data=pdf_data['bytes'],
@@ -2610,25 +2638,27 @@ def page_cooperative_tracing():
                                 key="download_compare_pdf_final",
                                 use_container_width=True
                             )
-                            if st.button("清除PDF缓存", key="clear_pdf_cache", use_container_width=True):
+                            if st.button("重新生成", key="regenerate_pdf", use_container_width=True):
                                 st.session_state.coop_pdf_data = None
                                 st.rerun()
                         
-                        if 'coop_pdf_error' in st.session_state and st.session_state.coop_pdf_error:
-                            st.error(f"❌ PDF生成失败: {st.session_state.coop_pdf_error}")
-                            if st.button("清除错误", key="clear_pdf_error", use_container_width=True):
+                        if st.session_state.get('coop_pdf_error'):
+                            st.error(f"❌ {st.session_state.coop_pdf_error}")
+                            st.caption("💡 可能原因：kaleido 未安装。请尝试执行: pip install kaleido")
+                            if st.button("清除错误提示", key="clear_pdf_error", use_container_width=True):
                                 st.session_state.coop_pdf_error = None
                                 st.rerun()
                     except Exception as import_err:
                         st.error(f"❌ 依赖缺失: {import_err}")
-                        st.info("请确保已安装 kaleido 包: pip install kaleido")
+                        st.info("请确保已安装 plotly 和 kaleido 包")
                 with col_export2:
                     st.caption("📝 PDF报告包含：雷达图截图、对比数据表格、自动生成的分析总结")
-                    st.caption("💡 提示：首次点击'导出PDF'生成报告，生成后可点击'下载'按钮保存文件")
+                    st.caption("💡 提示：点击'导出PDF'生成报告，生成后可点击'下载'按钮保存文件")
                 
                 st.markdown("---")
-            elif len(compare_selected) > 0 and len(compare_selected) < 2:
-                st.info("ℹ️ 请至少选择2个事件组进行对比分析（最多选择5个）")
+            elif len(compare_selected) < 2:
+                if cooperative_groups and len(cooperative_groups) > 0:
+                    st.info("ℹ️ 请至少选择2个事件组进行对比分析（最多选择5个）")
             
             if selected_gid and selected_gid in gid_options:
                 default_idx = gid_options.index(selected_gid)
