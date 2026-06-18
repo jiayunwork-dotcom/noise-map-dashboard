@@ -45,7 +45,7 @@ from alert_manager import (
     load_alert_history, save_alert_history, run_alert_engine_all_stations,
     get_alert_statistics, get_alerts_by_station, has_active_alerts,
     evaluate_alert_rule, ALERT_LEVELS, METRIC_NAMES, COMPARE_NAMES,
-    _count_noise_events
+    _count_noise_events, _parse_datetime, filter_alerts_by_date
 )
 
 st.set_page_config(
@@ -2058,9 +2058,23 @@ def _render_alert_history_panel():
         st.session_state.alert_selected_station = selected_station
     
     with col_f3:
+        default_start = datetime.now() - timedelta(days=7)
+        default_end = datetime.now()
+        if history:
+            alert_times = []
+            for a in history:
+                dt = _parse_datetime(a.get('alert_time', ''))
+                if dt:
+                    alert_times.append(dt)
+            if alert_times:
+                min_t = min(alert_times).date()
+                max_t = max(alert_times).date()
+                default_start = datetime.combine(min_t, datetime.min.time())
+                default_end = datetime.combine(max_t, datetime.max.time())
+        
         date_range = st.date_input(
             "时间范围",
-            value=(datetime.now() - timedelta(days=7), datetime.now()),
+            value=(default_start, default_end),
             key="alert_date_range_input"
         )
     
@@ -2074,12 +2088,7 @@ def _render_alert_history_panel():
     
     if date_range and len(date_range) == 2:
         start_date, end_date = date_range
-        start_dt = datetime.combine(start_date, datetime.min.time())
-        end_dt = datetime.combine(end_date, datetime.max.time())
-        filtered_history = [
-            a for a in filtered_history
-            if start_dt <= datetime.fromisoformat(a['alert_time'].replace('Z', '+00:00').replace('+00:00', '')) <= end_dt
-        ]
+        filtered_history = filter_alerts_by_date(filtered_history, start_date, end_date)
     
     filtered_history.sort(key=lambda x: x['alert_time'], reverse=True)
     
@@ -2128,15 +2137,14 @@ def _render_alert_history_panel():
                     st.rerun()
                 
                 if is_expanded:
-                    st.markdown("##### 📈 触发时刻前后5分钟Leq曲线")
+                    st.markdown("##### 📈 触发时刻前后Leq曲线")
                     
-                    try:
-                        alert_time = datetime.fromisoformat(alert['alert_time'].replace('Z', '+00:00').replace('+00:00', ''))
-                    except Exception:
+                    alert_time = _parse_datetime(alert.get('alert_time', ''))
+                    if not alert_time:
                         alert_time = datetime.now()
                     
-                    window_start = alert_time - timedelta(minutes=5)
-                    window_end = alert_time + timedelta(minutes=5)
+                    window_start = alert_time - timedelta(hours=2)
+                    window_end = alert_time + timedelta(hours=2)
                     
                     detail_df = get_station_measurements(
                         alert['station_id'],
@@ -2144,27 +2152,45 @@ def _render_alert_history_panel():
                         window_end.strftime('%Y-%m-%d %H:%M:%S')
                     )
                     
+                    if detail_df.empty:
+                        window_start = alert_time - timedelta(hours=24)
+                        window_end = alert_time + timedelta(hours=24)
+                        detail_df = get_station_measurements(
+                            alert['station_id'],
+                            window_start.strftime('%Y-%m-%d %H:%M:%S'),
+                            window_end.strftime('%Y-%m-%d %H:%M:%S')
+                        )
+                    
                     if not detail_df.empty:
                         fig_detail, ax_detail = plt.subplots(figsize=(10, 3))
                         times = detail_df['measurement_time']
                         leq_vals = detail_df['leq']
-                        ax_detail.plot(times, leq_vals, 'b-', linewidth=1.5, label='Leq')
-                        ax_detail.axhline(y=alert['threshold'], color='red', linestyle='--', 
+                        ax_detail.plot(times, leq_vals, 'b-o', linewidth=1.5, markersize=4, label='Leq')
+                        ax_detail.axhline(y=float(alert['threshold']), color='red', linestyle='--', 
                                          label=f'阈值 ({alert["threshold"]} dB)', alpha=0.7)
-                        ax_detail.axvline(x=alert_time, color='orange', linestyle=':', 
-                                         label='告警触发时刻', alpha=0.7)
+                        ax_detail.axvline(x=pd.Timestamp(alert_time), color='orange', linestyle=':', 
+                                         label='告警触发时刻', alpha=0.7, linewidth=2)
                         ax_detail.set_ylabel('Leq (dB)')
-                        ax_detail.set_title(f"站点 {alert['station_id']} - 告警触发前后")
+                        ax_detail.set_title(f"站点 {alert['station_id']} - 告警触发前后 ({window_start.strftime('%m-%d %H:%M')} ~ {window_end.strftime('%m-%d %H:%M')})")
                         ax_detail.legend(loc='best')
                         ax_detail.grid(True, alpha=0.3)
                         plt.xticks(rotation=45)
                         plt.tight_layout()
                         st.pyplot(fig_detail)
                         plt.close(fig_detail)
+                        
+                        peak_val = float(detail_df['leq'].max())
+                        peak_time = detail_df.loc[detail_df['leq'].idxmax(), 'measurement_time']
+                        st.caption(f"📊 窗口内峰值: {peak_val:.1f} dB @ {peak_time}")
                     else:
-                        st.info("该时段暂无监测数据")
+                        st.warning("该时段暂无监测数据，可能数据时间范围不匹配")
+                        data_range = get_measurement_time_range()
+                        if data_range:
+                            st.info(f"💡 现有数据范围: {data_range[0]} ~ {data_range[1]}")
                     
                     coop_info = _get_coop_event_info_for_alert(alert)
+                    if not coop_info:
+                        coop_info = _auto_run_coop_for_alert(alert)
                     if coop_info:
                         st.markdown("##### 🔗 协同溯源关联")
                         st.info(
@@ -2176,17 +2202,80 @@ def _render_alert_history_panel():
                     st.markdown("---")
 
 
+def _auto_run_coop_for_alert(alert: Dict) -> Optional[Dict]:
+    alert_time = _parse_datetime(alert.get('alert_time', ''))
+    if not alert_time:
+        return None
+    
+    station_id = alert.get('station_id')
+    stations_df = get_all_stations()
+    if stations_df.empty:
+        return None
+    
+    window_start = alert_time - timedelta(hours=6)
+    window_end = alert_time + timedelta(hours=6)
+    
+    nearby_stations = []
+    try:
+        target_row = stations_df[stations_df['station_id'] == station_id]
+        if not target_row.empty:
+            target_lat = float(target_row.iloc[0]['latitude'])
+            target_lon = float(target_row.iloc[0]['longitude'])
+            for _, row in stations_df.iterrows():
+                dist = haversine_distance(target_lat, target_lon, 
+                                          float(row['latitude']), float(row['longitude']))
+                if dist < 5000 or len(nearby_stations) < 5:
+                    nearby_stations.append((row['station_id'], dist))
+            nearby_stations.sort(key=lambda x: x[1])
+            selected_ids = [s[0] for s in nearby_stations[:min(8, len(nearby_stations))]]
+        else:
+            selected_ids = stations_df['station_id'].tolist()[:min(8, len(stations_df))]
+    except Exception:
+        selected_ids = stations_df['station_id'].tolist()[:min(8, len(stations_df))]
+    
+    if len(selected_ids) < 3:
+        return None
+    
+    try:
+        dist_matrix, delay_matrix, ordered_ids = compute_station_distance_matrix(
+            stations_df[stations_df['station_id'].isin(selected_ids)].drop_duplicates('station_id')
+        )
+        if len(ordered_ids) < 3:
+            return None
+        
+        all_events = detect_events_for_stations(ordered_ids, threshold_db=5.0)
+        cooperative_groups = match_cooperative_events(
+            all_events, dist_matrix, ordered_ids,
+            spectrum_threshold=0.5, time_tolerance=5.0
+        )
+        location_results = {}
+        for group in cooperative_groups:
+            selected_stations_subset = stations_df[
+                stations_df['station_id'].isin(group['participating_stations'])
+            ].drop_duplicates('station_id')
+            loc = estimate_source_location(group, selected_stations_subset)
+            location_results[group['group_id']] = loc
+        
+        st.session_state.coop_result = cooperative_groups
+        st.session_state.coop_locations = location_results
+        
+        return _get_coop_event_info_for_alert(alert)
+    except Exception as e:
+        return None
+
+
 def _get_coop_event_info_for_alert(alert: Dict) -> Optional[Dict]:
     coop_result = st.session_state.get('coop_result')
     if not coop_result:
         return None
     
     station_id = alert.get('station_id')
-    alert_time_str = alert.get('alert_time')
-    try:
-        alert_time = datetime.fromisoformat(alert_time_str.replace('Z', '+00:00').replace('+00:00', ''))
-    except Exception:
+    alert_time = _parse_datetime(alert.get('alert_time', ''))
+    if not alert_time:
         return None
+    
+    best_match = None
+    min_time_diff = float('inf')
     
     for group in coop_result:
         participating_stations = group.get('participating_stations', [])
@@ -2199,23 +2288,33 @@ def _get_coop_event_info_for_alert(alert: Dict) -> Optional[Dict]:
                 group_end = group_end.to_pydatetime()
             
             try:
-                if group_start - timedelta(hours=1) <= alert_time <= group_end + timedelta(hours=1):
-                    location_status = "未定位"
-                    locations = st.session_state.get('coop_locations')
-                    if locations and group.get('group_id') in locations:
-                        loc = locations[group['group_id']]
-                        if loc.get('located'):
-                            location_status = "已定位"
-                        elif loc.get('method'):
-                            location_status = f"部分定位({loc.get('method', '')})"
-                    
-                    return {
-                        'group_id': group['group_id'],
-                        'station_count': len(participating_stations),
-                        'location_status': location_status
-                    }
+                if group_start and group_end:
+                    if group_start - timedelta(hours=6) <= alert_time <= group_end + timedelta(hours=6):
+                        center_time = group_start + (group_end - group_start) / 2
+                        time_diff = abs((alert_time - center_time).total_seconds())
+                        if time_diff < min_time_diff:
+                            min_time_diff = time_diff
+                            best_match = group
             except Exception:
                 pass
+    
+    if best_match:
+        group = best_match
+        participating_stations = group.get('participating_stations', [])
+        location_status = "未定位"
+        locations = st.session_state.get('coop_locations')
+        if locations and group.get('group_id') in locations:
+            loc = locations[group['group_id']]
+            if loc.get('located'):
+                location_status = "已定位"
+            elif loc.get('method'):
+                location_status = f"部分定位({loc.get('method', '')})"
+        
+        return {
+            'group_id': group['group_id'],
+            'station_count': len(participating_stations),
+            'location_status': location_status
+        }
     
     return None
 

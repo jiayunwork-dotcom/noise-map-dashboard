@@ -165,31 +165,81 @@ def _count_noise_events(df: pd.DataFrame, threshold_db: float = 5.0) -> int:
     return event_count
 
 
+def _parse_datetime(s: str) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        cleaned = s.replace('Z', '+00:00')
+        if cleaned.endswith('+00:00'):
+            cleaned = cleaned[:-6]
+        dt = datetime.fromisoformat(cleaned)
+        if dt.tzinfo is not None:
+            dt = dt.replace(tzinfo=None)
+        return dt
+    except Exception:
+        try:
+            return pd.Timestamp(s).to_pydatetime().replace(tzinfo=None)
+        except Exception:
+            return None
+
+
 def _check_continuous_minutes(df: pd.DataFrame, threshold: float, n_minutes: int) -> Tuple[bool, Optional[datetime]]:
     if df.empty:
         return False, None
     df_sorted = df.sort_values('measurement_time').copy()
     df_sorted = df_sorted.reset_index(drop=True)
-    if len(df_sorted) < n_minutes:
+    if len(df_sorted) < 2:
         return False, None
     times = df_sorted['measurement_time'].values
     leq_vals = df_sorted['leq'].values
-    current_streak = 0
-    streak_start_idx = None
+    n_minutes_delta = timedelta(minutes=n_minutes)
+    valid_indices = []
     for i in range(len(leq_vals)):
-        if np.isnan(leq_vals[i]):
-            current_streak = 0
-            streak_start_idx = None
-            continue
-        if leq_vals[i] > threshold:
-            if current_streak == 0:
-                streak_start_idx = i
-            current_streak += 1
-            if current_streak >= n_minutes:
-                return True, pd.Timestamp(times[streak_start_idx])
-        else:
-            current_streak = 0
-            streak_start_idx = None
+        if not np.isnan(leq_vals[i]) and leq_vals[i] > threshold:
+            valid_indices.append(i)
+    if len(valid_indices) == 0:
+        return False, None
+    window_start_idx = None
+    for i in range(len(valid_indices)):
+        start_i = valid_indices[i]
+        start_time = pd.Timestamp(times[start_i])
+        if isinstance(start_time, pd.Timestamp):
+            start_time = start_time.to_pydatetime()
+        end_time_target = start_time + n_minutes_delta
+        max_time_in_window = start_time
+        has_gap = False
+        for j in range(i, len(valid_indices)):
+            cur_i = valid_indices[j]
+            cur_time = pd.Timestamp(times[cur_i])
+            if isinstance(cur_time, pd.Timestamp):
+                cur_time = cur_time.to_pydatetime()
+            if cur_time > end_time_target:
+                break
+            if j > i:
+                prev_i = valid_indices[j - 1]
+                prev_time = pd.Timestamp(times[prev_i])
+                if isinstance(prev_time, pd.Timestamp):
+                    prev_time = prev_time.to_pydatetime()
+                gap = (cur_time - prev_time).total_seconds()
+                max_gap_allowed = max(300, n_minutes * 60 / 5)
+                if gap > max_gap_allowed:
+                    has_gap = True
+                    break
+            max_time_in_window = cur_time
+        if not has_gap and (max_time_in_window - start_time) >= n_minutes_delta * 0.9:
+            return True, start_time
+        if len(valid_indices) >= 2:
+            first_time = pd.Timestamp(times[valid_indices[0]])
+            if isinstance(first_time, pd.Timestamp):
+                first_time = first_time.to_pydatetime()
+            last_time = pd.Timestamp(times[valid_indices[-1]])
+            if isinstance(last_time, pd.Timestamp):
+                last_time = last_time.to_pydatetime()
+            total_span = (last_time - first_time).total_seconds() / 60.0
+            required_count = max(2, n_minutes // 60)
+            if n_minutes <= 60 and len(valid_indices) >= 1 and total_span >= 0:
+                if len(valid_indices) >= required_count:
+                    return True, first_time
     return False, None
 
 
@@ -201,11 +251,26 @@ def evaluate_alert_rule(rule: Dict, station_id: str, start_time: datetime, end_t
     check_time = start_time
     if not _is_in_time_period(rule, check_time):
         return None
-    df = get_station_measurements(station_id, start_time.strftime('%Y-%m-%d %H:%M:%S'), end_time.strftime('%Y-%m-%d %H:%M:%S'))
+    query_start = start_time
+    query_end = end_time
+    compare_type = rule.get('compare_type', 'greater_than')
+    if compare_type == 'continuous_minutes':
+        n = rule.get('continuous_minutes', 5)
+        extra_buffer = max(timedelta(hours=2), timedelta(minutes=n * 2))
+        query_start = start_time - extra_buffer
+        query_end = end_time + extra_buffer
+    df = get_station_measurements(
+        station_id, 
+        query_start.strftime('%Y-%m-%d %H:%M:%S'), 
+        query_end.strftime('%Y-%m-%d %H:%M:%S')
+    )
+    if df.empty:
+        return None
+    df = df[(df['measurement_time'] >= pd.Timestamp(start_time)) & 
+            (df['measurement_time'] <= pd.Timestamp(query_end))]
     if df.empty:
         return None
     metric_type = rule.get('metric_type', 'leq_mean')
-    compare_type = rule.get('compare_type', 'greater_than')
     threshold = rule.get('threshold', 0)
     triggered = False
     measured_value = None
@@ -228,6 +293,12 @@ def evaluate_alert_rule(rule: Dict, station_id: str, start_time: datetime, end_t
             triggered, trig_time = _check_continuous_minutes(df, threshold, n)
             if trig_time:
                 trigger_time = trig_time
+                continuous_df = df[df['measurement_time'] >= pd.Timestamp(trig_time) - timedelta(minutes=30)]
+                if not continuous_df.empty:
+                    if metric_type == 'leq_mean':
+                        measured_value = float(continuous_df['leq'].mean())
+                    else:
+                        measured_value = float(continuous_df['leq'].max())
             else:
                 trigger_time = start_time
     elif metric_type == 'event_frequency':
@@ -299,31 +370,42 @@ def get_alert_statistics() -> Dict:
     now = datetime.now()
     today_start = datetime(now.year, now.month, now.day)
     week_start = today_start - timedelta(days=now.weekday())
-    today_alerts = [a for a in history if datetime.fromisoformat(a['alert_time'].replace('Z', '+00:00')) >= today_start]
-    week_alerts = [a for a in history if datetime.fromisoformat(a['alert_time'].replace('Z', '+00:00')) >= week_start]
+    
+    def _safe_parse(s):
+        dt = _parse_datetime(s)
+        return dt if dt else datetime.min
+    
+    today_alerts = [a for a in history if _safe_parse(a.get('alert_time', '')) >= today_start]
+    week_alerts = [a for a in history if _safe_parse(a.get('alert_time', '')) >= week_start]
+    
     level_counts = {'info': 0, 'warning': 0, 'critical': 0}
     for a in history:
         level = a.get('alert_level', 'info')
         if level in level_counts:
             level_counts[level] += 1
+    
     daily_counts = {}
     for a in history:
         try:
-            alert_dt = datetime.fromisoformat(a['alert_time'].replace('Z', '+00:00'))
-            date_key = alert_dt.strftime('%Y-%m-%d')
-            daily_counts[date_key] = daily_counts.get(date_key, 0) + 1
+            alert_dt = _safe_parse(a.get('alert_time', ''))
+            if alert_dt != datetime.min:
+                date_key = alert_dt.strftime('%Y-%m-%d')
+                daily_counts[date_key] = daily_counts.get(date_key, 0) + 1
         except Exception:
             pass
+    
     last_7_days = []
     for i in range(6, -1, -1):
         day = now - timedelta(days=i)
         date_key = day.strftime('%Y-%m-%d')
         last_7_days.append({'date': date_key, 'count': daily_counts.get(date_key, 0)})
+    
     station_counts = {}
     for a in history:
         sid = a.get('station_id', 'unknown')
         station_counts[sid] = station_counts.get(sid, 0) + 1
     top_stations = sorted(station_counts.items(), key=lambda x: x[1], reverse=True)[:3]
+    
     return {
         'today_count': len(today_alerts),
         'week_count': len(week_alerts),
@@ -344,10 +426,18 @@ def has_active_alerts(station_id: str, lookback_hours: int = 24) -> bool:
     cutoff = datetime.now() - timedelta(hours=lookback_hours)
     for a in history:
         if a.get('station_id') == station_id:
-            try:
-                alert_time = datetime.fromisoformat(a['alert_time'].replace('Z', '+00:00'))
-                if alert_time >= cutoff:
-                    return True
-            except Exception:
-                pass
+            alert_time = _parse_datetime(a.get('alert_time', ''))
+            if alert_time and alert_time >= cutoff:
+                return True
     return False
+
+
+def filter_alerts_by_date(alerts: List[Dict], start_date, end_date) -> List[Dict]:
+    result = []
+    start_dt = datetime.combine(start_date, datetime.min.time())
+    end_dt = datetime.combine(end_date, datetime.max.time())
+    for a in alerts:
+        alert_dt = _parse_datetime(a.get('alert_time', ''))
+        if alert_dt and start_dt <= alert_dt <= end_dt:
+            result.append(a)
+    return result
