@@ -19,7 +19,8 @@ from data_models import (
     get_all_stations, get_stations_by_region, get_station_measurements,
     get_latest_measurements, get_data_statistics, get_functional_zones,
     add_functional_zone, clear_functional_zones, ZONE_STANDARDS, FREQUENCY_BANDS,
-    save_noise_prediction, get_noise_predictions, delete_prediction
+    save_noise_prediction, get_noise_predictions, delete_prediction,
+    get_measurement_time_range
 )
 from data_import import import_csv_data, get_import_template, MIN_SOUND_LEVEL, MAX_SOUND_LEVEL
 from spatial_interpolation import run_interpolation, VARIOGRAM_MODELS, VARIOGRAM_NAMES
@@ -45,7 +46,9 @@ from alert_manager import (
     load_alert_history, save_alert_history, run_alert_engine_all_stations,
     get_alert_statistics, get_alerts_by_station, has_active_alerts,
     evaluate_alert_rule, ALERT_LEVELS, METRIC_NAMES, COMPARE_NAMES,
-    _count_noise_events, _parse_datetime, filter_alerts_by_date
+    _count_noise_events, _parse_datetime, filter_alerts_by_date,
+    RULE_TEMPLATES, detect_rule_conflicts, apply_rule_template,
+    enable_all_rules, disable_all_rules, export_rules_to_json
 )
 
 st.set_page_config(
@@ -102,7 +105,9 @@ def init_session_state():
         'alert_coop_cache': {},
         'alert_rule_form_key': 0,
         'alert_date_range_initialized': False,
-        'alert_default_date_range': None
+        'alert_default_date_range': None,
+        'alert_conflict_results': None,
+        'alert_template_applied_msg': None
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -1773,24 +1778,100 @@ def page_alert_management():
 
 def _render_alert_rules_panel():
     st.subheader("告警规则配置")
-    
+
     stations_df = get_all_stations()
     rules = load_alert_rules()
-    
+
+    rules_sorted = sorted(rules, key=lambda r: r.get('priority', 5), reverse=True)
+
+    st.markdown("#### 📚 规则模板（批量创建）")
+    col_tpl1, col_tpl2, col_tpl3, col_tpl4 = st.columns([1, 1, 1, 1.5])
+    with col_tpl1:
+        tpl_monitor = st.radio(
+            "模板监控范围",
+            options=['all', 'single'],
+            format_func=lambda x: '全部站点' if x == 'all' else '单个站点',
+            horizontal=True,
+            key="tpl_monitor"
+        )
+    tpl_station_id = None
+    if tpl_monitor == 'single':
+        with col_tpl2:
+            tpl_station_options = [(row['station_id'], f"{row.get('station_name', row['station_id'])} ({row['station_id']})")
+                                   for _, row in stations_df.iterrows()]
+            if tpl_station_options:
+                tpl_station_id = st.selectbox(
+                    "选择站点",
+                    options=[s[0] for s in tpl_station_options],
+                    format_func=lambda x: next((lbl for sid, lbl in tpl_station_options if sid == x), x),
+                    key="tpl_station"
+                )
+    with col_tpl3:
+        selected_template = st.selectbox(
+            "选择模板",
+            options=list(RULE_TEMPLATES.keys()),
+            format_func=lambda k: RULE_TEMPLATES[k]['name'],
+            key="tpl_selector"
+        )
+    with col_tpl4:
+        st.caption(RULE_TEMPLATES[selected_template]['description'])
+        if st.button("📋 应用模板", type="primary", use_container_width=True, key="apply_template_btn"):
+            created = apply_rule_template(selected_template, tpl_monitor, tpl_station_id)
+            if created:
+                st.session_state.alert_template_applied_msg = f"✅ 成功创建 {len(created)} 条规则: {', '.join(r['rule_name'] for r in created)}"
+                st.rerun()
+
+    if st.session_state.alert_template_applied_msg:
+        st.success(st.session_state.alert_template_applied_msg)
+        st.session_state.alert_template_applied_msg = None
+
+    st.markdown("---")
+
+    st.markdown(f"#### 📋 规则列表 ({len(rules_sorted)}条)")
+    col_batch1, col_batch2, col_batch3, _ = st.columns([1, 1, 1, 2])
+    with col_batch1:
+        if st.button("🟢 全部启用", use_container_width=True, key="enable_all_btn"):
+            if enable_all_rules():
+                st.success("已启用全部规则")
+                st.rerun()
+            else:
+                st.error("操作失败")
+    with col_batch2:
+        if st.button("🔴 全部禁用", use_container_width=True, key="disable_all_btn"):
+            if disable_all_rules():
+                st.success("已禁用全部规则")
+                st.rerun()
+            else:
+                st.error("操作失败")
+    with col_batch3:
+        export_json = export_rules_to_json()
+        st.download_button(
+            label="⬇️ 导出规则",
+            data=export_json,
+            file_name=f"alert_rules_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+            mime="application/json",
+            use_container_width=True,
+            key="export_rules_btn"
+        )
+
     col_form, col_list = st.columns([1, 1.5])
-    
+
     with col_form:
         st.markdown("#### ✏️ 新建/编辑规则")
-        
+
         editing_rule = st.session_state.alert_editing_rule
-        
+        if st.session_state.alert_conflict_results is None:
+            conflict_display_state = False
+        else:
+            conflict_display_state = True
+
         with st.form("alert_rule_form"):
             rule_name = st.text_input(
                 "规则名称",
                 value=editing_rule.get('rule_name', '') if editing_rule else '',
                 placeholder="请输入规则名称"
             )
-            
+
             monitor_target = st.radio(
                 "监控对象",
                 options=['all', 'single'],
@@ -1798,10 +1879,10 @@ def _render_alert_rules_panel():
                 index=0 if (not editing_rule or editing_rule.get('monitor_target') == 'all') else 1,
                 horizontal=True
             )
-            
+
             station_id = None
             if monitor_target == 'single':
-                station_options = [(row['station_id'], f"{row.get('station_name', row['station_id'])} ({row['station_id']})") 
+                station_options = [(row['station_id'], f"{row.get('station_name', row['station_id'])} ({row['station_id']})")
                                    for _, row in stations_df.iterrows()]
                 default_station = editing_rule.get('station_id') if editing_rule else (station_options[0][0] if station_options else None)
                 station_id = st.selectbox(
@@ -1810,7 +1891,27 @@ def _render_alert_rules_panel():
                     format_func=lambda x: next((lbl for sid, lbl in station_options if sid == x), x),
                     index=0
                 )
-            
+
+            col_p1, col_p2 = st.columns(2)
+            with col_p1:
+                priority = st.slider(
+                    "优先级 (1-10)",
+                    min_value=1,
+                    max_value=10,
+                    value=int(editing_rule.get('priority', 5)) if editing_rule else 5,
+                    step=1,
+                    help="数字越大优先级越高，同站点同窗口多条同时命中时仅保留最高优先级的告警"
+                )
+            with col_p2:
+                silent_period = st.number_input(
+                    "静默期 (分钟)",
+                    min_value=0,
+                    max_value=1440,
+                    value=int(editing_rule.get('silent_period', 0)) if editing_rule else 0,
+                    step=5,
+                    help="同一条规则针对同一站点触发后，在静默期内不重复生成告警，0表示不静默"
+                )
+
             metric_type = st.selectbox(
                 "触发指标",
                 options=['leq_mean', 'leq_peak', 'event_frequency'],
@@ -1820,15 +1921,15 @@ def _render_alert_rules_panel():
                 ) if editing_rule else 0,
                 key="alert_form_metric_type"
             )
-            
+
             compare_options = ['greater_than', 'greater_equal']
             if metric_type != 'event_frequency':
                 compare_options.append('continuous_minutes')
-            
+
             prev_compare = editing_rule.get('compare_type', 'greater_than') if editing_rule else 'greater_than'
             if prev_compare not in compare_options:
                 prev_compare = compare_options[0]
-            
+
             compare_type = st.selectbox(
                 "比较方式",
                 options=compare_options,
@@ -1836,7 +1937,7 @@ def _render_alert_rules_panel():
                 index=compare_options.index(prev_compare),
                 key=f"alert_form_compare_{metric_type}"
             )
-            
+
             threshold = st.number_input(
                 "阈值数值",
                 value=float(editing_rule.get('threshold', 60.0)) if editing_rule else 60.0,
@@ -1844,7 +1945,7 @@ def _render_alert_rules_panel():
                 step=0.5,
                 help="Leq单位为dB，事件频次单位为次"
             )
-            
+
             continuous_minutes = 5
             if compare_type == 'continuous_minutes' and metric_type != 'event_frequency':
                 continuous_minutes = st.slider(
@@ -1855,7 +1956,7 @@ def _render_alert_rules_panel():
                     step=1,
                     key=f"alert_form_continuous_{metric_type}"
                 )
-            
+
             alert_level = st.selectbox(
                 "告警等级",
                 options=['info', 'warning', 'critical'],
@@ -1864,7 +1965,7 @@ def _render_alert_rules_panel():
                     editing_rule.get('alert_level', 'warning')
                 ) if editing_rule else 1
             )
-            
+
             time_period = st.radio(
                 "生效时段",
                 options=['all_day', 'custom'],
@@ -1872,7 +1973,7 @@ def _render_alert_rules_panel():
                 index=0 if (not editing_rule or editing_rule.get('time_period') == 'all_day') else 1,
                 horizontal=True
             )
-            
+
             start_time = "08:00"
             end_time = "20:00"
             if time_period == 'custom':
@@ -1889,13 +1990,13 @@ def _render_alert_rules_panel():
                         value=editing_rule.get('end_time', '20:00') if editing_rule else '20:00',
                         placeholder="HH:MM"
                     )
-            
+
             enabled = st.toggle(
                 "启用规则",
                 value=editing_rule.get('enabled', True) if editing_rule else True
             )
-            
-            col_submit, col_cancel = st.columns(2)
+
+            col_submit, col_cancel, col_check = st.columns([1.2, 1, 1])
             with col_submit:
                 submit_label = "保存修改" if editing_rule else "➕ 新建规则"
                 submitted = st.form_submit_button(submit_label, type="primary", use_container_width=True)
@@ -1904,8 +2005,27 @@ def _render_alert_rules_panel():
                     cancel = st.form_submit_button("取消编辑", use_container_width=True)
                     if cancel:
                         st.session_state.alert_editing_rule = None
+                        st.session_state.alert_conflict_results = None
                         st.rerun()
-            
+            with col_check:
+                conflict_check = st.form_submit_button("⚠️ 冲突检测", use_container_width=True)
+
+            if conflict_check:
+                temp_rule_data = {
+                    'rule_name': rule_name,
+                    'monitor_target': monitor_target,
+                    'station_id': station_id,
+                    'metric_type': metric_type,
+                    'compare_type': compare_type,
+                    'threshold': threshold,
+                    'continuous_minutes': continuous_minutes,
+                    'priority': priority
+                }
+                exclude_id = editing_rule.get('rule_id') if editing_rule else None
+                conflicts = detect_rule_conflicts(temp_rule_data, exclude_id)
+                st.session_state.alert_conflict_results = conflicts
+                conflict_display_state = True
+
             if submitted:
                 rule_data = {
                     'rule_name': rule_name,
@@ -1919,11 +2039,13 @@ def _render_alert_rules_panel():
                     'time_period': time_period,
                     'start_time': start_time,
                     'end_time': end_time,
-                    'enabled': enabled
+                    'enabled': enabled,
+                    'priority': priority,
+                    'silent_period': silent_period
                 }
                 if editing_rule:
                     rule_data['rule_id'] = editing_rule['rule_id']
-                
+
                 if not rule_name.strip():
                     st.error("请输入规则名称")
                 else:
@@ -1931,28 +2053,45 @@ def _render_alert_rules_panel():
                     if result:
                         st.success(f"规则已保存: {result['rule_name']}")
                         st.session_state.alert_editing_rule = None
+                        st.session_state.alert_conflict_results = None
                         st.rerun()
                     else:
                         st.error("保存规则失败")
-    
+
+        if st.session_state.alert_conflict_results is not None:
+            conflicts = st.session_state.alert_conflict_results
+            if conflicts:
+                st.markdown("##### ⚠️ 检测到规则冲突")
+                for c in conflicts:
+                    st.warning(
+                        f"**冲突规则**: {c['rule_name']} (ID: {c['rule_id']})\n\n"
+                        f"**原因**: {c['reason']}\n\n"
+                        f"**优先级对比**: 新规则 {c['new_priority']} vs 现有规则 {c['existing_priority']}"
+                    )
+            else:
+                st.success("✅ 未检测到冲突规则")
+
     with col_list:
-        st.markdown(f"#### 📋 规则列表 ({len(rules)}条)")
-        
-        if not rules:
-            st.info("暂无告警规则，请在左侧创建")
+        st.markdown("#### 规则详情（按优先级从高到低排序）")
+
+        if not rules_sorted:
+            st.info("暂无告警规则，请在左侧创建或应用模板")
         else:
-            for i, rule in enumerate(rules):
+            for i, rule in enumerate(rules_sorted):
                 level_info = ALERT_LEVELS.get(rule.get('alert_level', 'info'), {})
                 status_icon = "✅" if rule.get('enabled', True) else "⏸️"
                 target_text = "全部站点" if rule.get('monitor_target') == 'all' else f"站点: {rule.get('station_id', '-')}"
-                
+                priority_val = rule.get('priority', 5)
+                priority_stars = "⭐" * min(priority_val, 10)
+
                 with st.expander(
-                    f"{status_icon} **{rule['rule_name']}** - {level_info.get('name', '')}",
+                    f"{status_icon} **{rule['rule_name']}** [{priority_val}] {priority_stars} - {level_info.get('name', '')}",
                     expanded=False
                 ):
                     col_info, col_actions = st.columns([3, 1])
-                    
+
                     with col_info:
+                        st.markdown(f"**优先级**: {priority_val}/10")
                         st.markdown(f"**监控对象**: {target_text}")
                         st.markdown(f"**触发指标**: {METRIC_NAMES.get(rule.get('metric_type'), '-')}")
                         st.markdown(f"**比较方式**: {COMPARE_NAMES.get(rule.get('compare_type'), '-')}")
@@ -1963,12 +2102,15 @@ def _render_alert_rules_panel():
                         period_text = "全天" if rule.get('time_period') == 'all_day' else f"{rule.get('start_time', '')} - {rule.get('end_time', '')}"
                         st.markdown(f"**生效时段**: {period_text}")
                         st.markdown(f"**告警等级**: :{level_info.get('color', '#666')}[{level_info.get('name', '')}]")
-                    
+                        sp_text = f"{rule.get('silent_period', 0)} 分钟" if rule.get('silent_period', 0) > 0 else "不静默"
+                        st.markdown(f"**静默期**: {sp_text}")
+
                     with col_actions:
                         if st.button("✏️ 编辑", key=f"edit_rule_{rule['rule_id']}", use_container_width=True):
                             st.session_state.alert_editing_rule = rule
+                            st.session_state.alert_conflict_results = None
                             st.rerun()
-                        
+
                         if st.button("🗑️ 删除", key=f"del_rule_{rule['rule_id']}", use_container_width=True):
                             if delete_alert_rule(rule['rule_id']):
                                 st.success("规则已删除")
@@ -1986,13 +2128,15 @@ def _render_alert_history_panel():
     
     st.markdown("### 📈 统计概览")
     
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("今日告警数", stats['today_count'])
     with col2:
         st.metric("本周告警数", stats['week_count'])
     with col3:
         st.metric("历史总告警", stats['total_count'])
+    with col4:
+        st.metric("⬆️ 升级告警数", stats.get('upgraded_count', 0))
     
     col_pie, col_trend, col_top = st.columns([1, 1.5, 1])
     
@@ -2113,27 +2257,42 @@ def _render_alert_history_panel():
             level_info = ALERT_LEVELS.get(alert.get('alert_level', 'info'), {})
             bg_color = level_info.get('bg_color', '#fff')
             text_color = level_info.get('color', '#333')
-            
+            is_upgraded = alert.get('upgraded', False)
+            original_level_info = ALERT_LEVELS.get(alert.get('original_level', alert.get('alert_level', 'info')), {})
+
             is_expanded = st.session_state.alert_expanded_row == alert['alert_id']
-            
+
             with st.container():
+                upgrade_icon = "⬆️" if is_upgraded else "&nbsp;&nbsp;"
+                upgrade_badge = ""
+                if is_upgraded:
+                    upgrade_badge = (
+                        f"<span style='margin-left:8px; background:#FF5722; color:white; "
+                        f"padding:2px 8px; border-radius:10px; font-size:11px; font-weight:bold;'>"
+                        f"升级: {original_level_info.get('name', '')}→{level_info.get('name', '')}</span>"
+                    )
+
                 st.markdown(
                     f"""
                     <div style="background-color: {bg_color}; padding: 12px; border-radius: 8px; margin-bottom: 4px;">
                         <div style="display: flex; justify-content: space-between; align-items: center;">
-                            <div>
-                                <span style="font-weight: bold; color: {text_color};">
-                                    [{level_info.get('name', '')}] {alert['rule_name']}
-                                </span>
-                                <span style="margin-left: 12px; color: #666;">
-                                    站点: {alert['station_id']}
-                                </span>
+                            <div style="display: flex; align-items: center;">
+                                <span style="font-size: 20px; margin-right: 8px; min-width: 24px; text-align: center;">{upgrade_icon}</span>
+                                <div>
+                                    <span style="font-weight: bold; color: {text_color};">
+                                        [{level_info.get('name', '')}] {alert['rule_name']}
+                                    </span>
+                                    {upgrade_badge}
+                                    <span style="margin-left: 12px; color: #666;">
+                                        站点: {alert['station_id']}
+                                    </span>
+                                </div>
                             </div>
                             <div style="color: #666; font-size: 0.9em;">
                                 {alert['alert_time']}
                             </div>
                         </div>
-                        <div style="margin-top: 6px; color: #555;">
+                        <div style="margin-top: 6px; color: #555; margin-left: 32px;">
                             实测值: <strong>{alert['measured_value']}</strong> / 阈值: {alert['threshold']}
                         </div>
                     </div>

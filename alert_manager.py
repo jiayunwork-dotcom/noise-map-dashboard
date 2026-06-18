@@ -17,6 +17,8 @@ ALERT_LEVELS = {
     'critical': {'name': '严重', 'color': '#F44336', 'bg_color': '#FFEBEE'}
 }
 
+ALERT_LEVEL_ORDER = ['info', 'warning', 'critical']
+
 METRIC_TYPES = ['leq_mean', 'leq_peak', 'event_frequency']
 METRIC_NAMES = {
     'leq_mean': 'Leq均值',
@@ -29,6 +31,115 @@ COMPARE_NAMES = {
     'greater_than': '大于',
     'greater_equal': '大于等于',
     'continuous_minutes': '连续N分钟超过'
+}
+
+RULE_TEMPLATES = {
+    'industrial': {
+        'name': '工业区标准',
+        'description': '适用于工业区，对噪声限值较宽松',
+        'rules': [
+            {
+                'rule_name': '工业区-Leq均值超限',
+                'metric_type': 'leq_mean',
+                'compare_type': 'greater_than',
+                'threshold': 70.0,
+                'alert_level': 'warning',
+                'priority': 5,
+                'silent_period': 30
+            },
+            {
+                'rule_name': '工业区-Leq峰值超限',
+                'metric_type': 'leq_peak',
+                'compare_type': 'greater_than',
+                'threshold': 85.0,
+                'alert_level': 'critical',
+                'priority': 8,
+                'silent_period': 15
+            },
+            {
+                'rule_name': '工业区-连续噪声',
+                'metric_type': 'leq_mean',
+                'compare_type': 'continuous_minutes',
+                'threshold': 65.0,
+                'continuous_minutes': 30,
+                'alert_level': 'warning',
+                'priority': 6,
+                'silent_period': 60
+            }
+        ]
+    },
+    'commercial': {
+        'name': '商业区标准',
+        'description': '适用于商业中心区，中等限值',
+        'rules': [
+            {
+                'rule_name': '商业区-Leq均值超限',
+                'metric_type': 'leq_mean',
+                'compare_type': 'greater_than',
+                'threshold': 60.0,
+                'alert_level': 'warning',
+                'priority': 5,
+                'silent_period': 30
+            },
+            {
+                'rule_name': '商业区-Leq峰值超限',
+                'metric_type': 'leq_peak',
+                'compare_type': 'greater_than',
+                'threshold': 75.0,
+                'alert_level': 'critical',
+                'priority': 8,
+                'silent_period': 15
+            },
+            {
+                'rule_name': '商业区-事件频次',
+                'metric_type': 'event_frequency',
+                'compare_type': 'greater_than',
+                'threshold': 5.0,
+                'alert_level': 'info',
+                'priority': 3,
+                'silent_period': 120
+            }
+        ]
+    },
+    'residential': {
+        'name': '居民区标准',
+        'description': '适用于居民区，对噪声要求严格',
+        'rules': [
+            {
+                'rule_name': '居民区-Leq均值超限(昼间)',
+                'metric_type': 'leq_mean',
+                'compare_type': 'greater_than',
+                'threshold': 55.0,
+                'alert_level': 'warning',
+                'priority': 7,
+                'time_period': 'custom',
+                'start_time': '06:00',
+                'end_time': '22:00',
+                'silent_period': 20
+            },
+            {
+                'rule_name': '居民区-Leq均值超限(夜间)',
+                'metric_type': 'leq_mean',
+                'compare_type': 'greater_than',
+                'threshold': 45.0,
+                'alert_level': 'critical',
+                'priority': 10,
+                'time_period': 'custom',
+                'start_time': '22:00',
+                'end_time': '06:00',
+                'silent_period': 10
+            },
+            {
+                'rule_name': '居民区-Leq峰值超限',
+                'metric_type': 'leq_peak',
+                'compare_type': 'greater_than',
+                'threshold': 70.0,
+                'alert_level': 'critical',
+                'priority': 9,
+                'silent_period': 15
+            }
+        ]
+    }
 }
 
 
@@ -54,7 +165,14 @@ def _save_json_file(filepath: str, data: any) -> bool:
 
 def load_alert_rules() -> List[Dict]:
     rules = _load_json_file(ALERT_RULES_FILE, [])
-    return rules if isinstance(rules, list) else []
+    if isinstance(rules, list):
+        for r in rules:
+            if 'priority' not in r:
+                r['priority'] = 5
+            if 'silent_period' not in r:
+                r['silent_period'] = 0
+        return rules
+    return []
 
 
 def save_alert_rules(rules: List[Dict]) -> bool:
@@ -63,7 +181,14 @@ def save_alert_rules(rules: List[Dict]) -> bool:
 
 def load_alert_history() -> List[Dict]:
     history = _load_json_file(ALERT_HISTORY_FILE, [])
-    return history if isinstance(history, list) else []
+    if isinstance(history, list):
+        for a in history:
+            if 'upgraded' not in a:
+                a['upgraded'] = False
+            if 'original_level' not in a:
+                a['original_level'] = a.get('alert_level', 'info')
+        return history
+    return []
 
 
 def save_alert_history(history: List[Dict]) -> bool:
@@ -73,6 +198,20 @@ def save_alert_history(history: List[Dict]) -> bool:
 def add_alert_rule(rule_data: Dict) -> Optional[Dict]:
     rules = load_alert_rules()
     rule_id = rule_data.get('rule_id') or f"RULE-{uuid.uuid4().hex[:8].upper()}"
+    priority = rule_data.get('priority', 5)
+    try:
+        priority = int(priority)
+        priority = max(1, min(10, priority))
+    except Exception:
+        priority = 5
+
+    silent_period = rule_data.get('silent_period', 0)
+    try:
+        silent_period = int(silent_period)
+        silent_period = max(0, silent_period)
+    except Exception:
+        silent_period = 0
+
     new_rule = {
         'rule_id': rule_id,
         'rule_name': rule_data.get('rule_name', ''),
@@ -86,6 +225,8 @@ def add_alert_rule(rule_data: Dict) -> Optional[Dict]:
         'time_period': rule_data.get('time_period', 'all_day'),
         'start_time': rule_data.get('start_time', '08:00'),
         'end_time': rule_data.get('end_time', '20:00'),
+        'priority': priority,
+        'silent_period': silent_period,
         'enabled': rule_data.get('enabled', True),
         'created_at': datetime.now().isoformat(),
         'updated_at': datetime.now().isoformat()
@@ -110,6 +251,126 @@ def delete_alert_rule(rule_id: str) -> bool:
     return save_alert_rules(rules)
 
 
+def enable_all_rules() -> bool:
+    rules = load_alert_rules()
+    for r in rules:
+        r['enabled'] = True
+        r['updated_at'] = datetime.now().isoformat()
+    return save_alert_rules(rules)
+
+
+def disable_all_rules() -> bool:
+    rules = load_alert_rules()
+    for r in rules:
+        r['enabled'] = False
+        r['updated_at'] = datetime.now().isoformat()
+    return save_alert_rules(rules)
+
+
+def apply_rule_template(template_key: str, monitor_target: str = 'all', station_id: Optional[str] = None) -> List[Dict]:
+    template = RULE_TEMPLATES.get(template_key)
+    if not template:
+        return []
+
+    created_rules = []
+    for tmpl_rule in template['rules']:
+        rule_data = tmpl_rule.copy()
+        rule_data['monitor_target'] = monitor_target
+        rule_data['station_id'] = station_id
+        rule_data['enabled'] = True
+        if 'time_period' not in rule_data:
+            rule_data['time_period'] = 'all_day'
+        if 'start_time' not in rule_data:
+            rule_data['start_time'] = '08:00'
+        if 'end_time' not in rule_data:
+            rule_data['end_time'] = '20:00'
+        if 'continuous_minutes' not in rule_data:
+            rule_data['continuous_minutes'] = 5
+        result = add_alert_rule(rule_data)
+        if result:
+            created_rules.append(result)
+    return created_rules
+
+
+def detect_rule_conflicts(new_rule_data: Dict, exclude_rule_id: Optional[str] = None) -> List[Dict]:
+    rules = load_alert_rules()
+    conflicts = []
+
+    new_monitor = new_rule_data.get('monitor_target', 'all')
+    new_station = new_rule_data.get('station_id')
+    new_metric = new_rule_data.get('metric_type', 'leq_mean')
+    new_compare = new_rule_data.get('compare_type', 'greater_than')
+    new_threshold = float(new_rule_data.get('threshold', 0))
+
+    for existing in rules:
+        if exclude_rule_id and existing.get('rule_id') == exclude_rule_id:
+            continue
+
+        if not existing.get('enabled', True):
+            continue
+
+        ex_monitor = existing.get('monitor_target', 'all')
+        ex_station = existing.get('station_id')
+        ex_metric = existing.get('metric_type', 'leq_mean')
+        ex_compare = existing.get('compare_type', 'greater_than')
+        ex_threshold = float(existing.get('threshold', 0))
+
+        monitor_same = False
+        if new_monitor == 'all' and ex_monitor == 'all':
+            monitor_same = True
+        elif new_monitor == 'single' and ex_monitor == 'all':
+            monitor_same = True
+        elif new_monitor == 'all' and ex_monitor == 'single':
+            monitor_same = True
+        elif new_monitor == 'single' and ex_monitor == 'single' and new_station == ex_station:
+            monitor_same = True
+
+        if not monitor_same:
+            continue
+
+        if new_metric != ex_metric:
+            continue
+
+        threshold_overlap = False
+        conflict_reason = ''
+
+        if new_compare in ['greater_than', 'greater_equal'] and ex_compare in ['greater_than', 'greater_equal']:
+            threshold_overlap = True
+            if new_threshold > ex_threshold:
+                conflict_reason = f"阈值范围重叠：新规则阈值({new_threshold}) > 现有规则阈值({ex_threshold})，大于高阈值的情况会同时触发两条规则"
+            elif new_threshold < ex_threshold:
+                conflict_reason = f"阈值范围重叠：新规则阈值({new_threshold}) < 现有规则阈值({ex_threshold})，大于低阈值的情况会同时触发两条规则"
+            else:
+                conflict_reason = f"阈值完全相同({new_threshold})，两条规则会同时触发"
+        elif new_compare == 'continuous_minutes' and ex_compare in ['greater_than', 'greater_equal']:
+            if new_threshold <= ex_threshold:
+                threshold_overlap = True
+                conflict_reason = f"连续阈值({new_threshold})低于/等于单次阈值({ex_threshold})，连续超标的情况会同时触发"
+        elif new_compare in ['greater_than', 'greater_equal'] and ex_compare == 'continuous_minutes':
+            if ex_threshold <= new_threshold:
+                threshold_overlap = True
+                conflict_reason = f"单次阈值({new_threshold})高于/等于连续阈值({ex_threshold})，连续超标的情况会同时触发"
+        elif new_compare == 'continuous_minutes' and ex_compare == 'continuous_minutes':
+            threshold_overlap = True
+            if new_threshold > ex_threshold:
+                conflict_reason = f"连续阈值重叠：新规则({new_threshold}dB连续{new_rule_data.get('continuous_minutes', 5)}min) vs 现有规则({ex_threshold}dB连续{existing.get('continuous_minutes', 5)}min)"
+            elif new_threshold < ex_threshold:
+                conflict_reason = f"连续阈值重叠：新规则({new_threshold}dB)阈值更低，会先于现有规则触发"
+            else:
+                conflict_reason = f"连续阈值完全相同({new_threshold}dB)，需关注连续时长差异"
+
+        if threshold_overlap:
+            conflicts.append({
+                'rule_id': existing.get('rule_id'),
+                'rule_name': existing.get('rule_name', '未命名规则'),
+                'reason': conflict_reason,
+                'existing_priority': existing.get('priority', 5),
+                'new_priority': new_rule_data.get('priority', 5)
+            })
+
+    return conflicts
+
+
 def _is_in_time_period(rule: Dict, check_time: datetime) -> bool:
     if rule.get('time_period') == 'all_day':
         return True
@@ -118,7 +379,7 @@ def _is_in_time_period(rule: Dict, check_time: datetime) -> bool:
     try:
         start_h, start_m = map(int, start_str.split(':'))
         end_h, end_m = map(int, end_str.split(':'))
-        current_minutes = check_time.hour * 60 + check_time.minute
+        current_minutes = check_time.hour * 60 + check_time.min
         start_minutes = start_h * 60 + start_m
         end_minutes = end_h * 60 + end_m
         if start_minutes <= end_minutes:
@@ -190,17 +451,17 @@ def _check_continuous_minutes(df: pd.DataFrame, threshold: float, n_minutes: int
     df_sorted = df_sorted.reset_index(drop=True)
     if len(df_sorted) < 1:
         return False, None
-    
+
     times = df_sorted['measurement_time'].values
     leq_vals = df_sorted['leq'].values
-    
+
     py_times = []
     for t in times:
         pt = pd.Timestamp(t)
         if isinstance(pt, pd.Timestamp):
             pt = pt.to_pydatetime()
         py_times.append(pt)
-    
+
     raw_sample_interval_sec = None
     if len(py_times) >= 3:
         intervals = []
@@ -214,35 +475,35 @@ def _check_continuous_minutes(df: pd.DataFrame, threshold: float, n_minutes: int
         diff = (py_times[1] - py_times[0]).total_seconds()
         if diff > 0:
             raw_sample_interval_sec = diff
-    
+
     n_seconds_target = n_minutes * 60.0
-    
+
     if raw_sample_interval_sec is not None and raw_sample_interval_sec >= n_seconds_target:
         return False, None
-    
+
     sample_interval_sec = raw_sample_interval_sec if raw_sample_interval_sec is not None else 3600.0
-    
+
     REASONABLE_MAX_INTERVAL_SEC = 30 * 60.0
     capped_sample_interval = min(sample_interval_sec, REASONABLE_MAX_INTERVAL_SEC)
-    
+
     if capped_sample_interval > n_seconds_target * 0.5:
         min_points_needed = int(np.ceil(n_seconds_target / capped_sample_interval)) + 1
     else:
         min_points_needed = 2
-    
+
     max_gap_sec = min(
         max(capped_sample_interval * 2.0, capped_sample_interval + 5 * 60.0),
         max(n_seconds_target * 0.3, 10 * 60.0)
     )
-    
+
     valid_data = []
     for i in range(len(py_times)):
         if not np.isnan(leq_vals[i]) and leq_vals[i] > threshold:
             valid_data.append((py_times[i], float(leq_vals[i])))
-    
+
     if not valid_data:
         return False, None
-    
+
     segments = []
     current_segment = [valid_data[0]]
     for i in range(1, len(valid_data)):
@@ -254,10 +515,10 @@ def _check_continuous_minutes(df: pd.DataFrame, threshold: float, n_minutes: int
             current_segment = [valid_data[i]]
     if current_segment:
         segments.append(current_segment)
-    
+
     best_segment = None
     best_duration = 0.0
-    
+
     for seg in segments:
         if len(seg) < min_points_needed:
             continue
@@ -265,15 +526,15 @@ def _check_continuous_minutes(df: pd.DataFrame, threshold: float, n_minutes: int
             seg_duration = capped_sample_interval
         else:
             seg_duration = (seg[-1][0] - seg[0][0]).total_seconds() + capped_sample_interval
-        
+
         if seg_duration >= n_seconds_target * 0.9:
             if seg_duration > best_duration:
                 best_duration = seg_duration
                 best_segment = seg
-    
+
     if best_segment is not None:
         return True, best_segment[0][0]
-    
+
     return False, None
 
 
@@ -294,13 +555,13 @@ def evaluate_alert_rule(rule: Dict, station_id: str, start_time: datetime, end_t
         query_start = start_time - extra_buffer
         query_end = end_time + extra_buffer
     df = get_station_measurements(
-        station_id, 
-        query_start.strftime('%Y-%m-%d %H:%M:%S'), 
+        station_id,
+        query_start.strftime('%Y-%m-%d %H:%M:%S'),
         query_end.strftime('%Y-%m-%d %H:%M:%S')
     )
     if df.empty:
         return None
-    df = df[(df['measurement_time'] >= pd.Timestamp(start_time)) & 
+    df = df[(df['measurement_time'] >= pd.Timestamp(start_time)) &
             (df['measurement_time'] <= pd.Timestamp(query_end))]
     if df.empty:
         return None
@@ -356,21 +617,118 @@ def evaluate_alert_rule(rule: Dict, station_id: str, start_time: datetime, end_t
             'threshold': threshold,
             'trigger_time': trigger_time.isoformat() if isinstance(trigger_time, (datetime, pd.Timestamp)) else str(trigger_time),
             'window_start': start_time.isoformat(),
-            'window_end': end_time.isoformat()
+            'window_end': end_time.isoformat(),
+            'priority': rule.get('priority', 5),
+            'silent_period': rule.get('silent_period', 0)
         }
     return None
 
 
+def _resolve_priority_conflicts(alerts: List[Dict]) -> List[Dict]:
+    if not alerts:
+        return []
+
+    station_groups = {}
+    for alert in alerts:
+        key = (alert['station_id'], alert['window_start'], alert['window_end'])
+        if key not in station_groups:
+            station_groups[key] = []
+        station_groups[key].append(alert)
+
+    resolved = []
+    for key, group in station_groups.items():
+        if len(group) == 1:
+            resolved.extend(group)
+            continue
+
+        max_priority = max(a.get('priority', 5) for a in group)
+        max_priority_alerts = [a for a in group if a.get('priority', 5) == max_priority]
+        resolved.extend(max_priority_alerts)
+
+    return resolved
+
+
+def _check_silent_period(alert: Dict, history: List[Dict]) -> bool:
+    silent_period = alert.get('silent_period', 0)
+    if silent_period <= 0:
+        return True
+
+    rule_id = alert['rule_id']
+    station_id = alert['station_id']
+    trigger_time_str = alert.get('trigger_time', '')
+    trigger_time = _parse_datetime(trigger_time_str)
+    if not trigger_time:
+        return True
+
+    cutoff = trigger_time - timedelta(minutes=silent_period)
+
+    for past in history:
+        if past.get('rule_id') != rule_id or past.get('station_id') != station_id:
+            continue
+        past_time = _parse_datetime(past.get('alert_time', ''))
+        if past_time and past_time >= cutoff and past_time < trigger_time:
+            return False
+
+    return True
+
+
+def _check_and_apply_upgrade(alert: Dict, history: List[Dict]) -> Tuple[str, bool]:
+    rule_id = alert['rule_id']
+    station_id = alert['station_id']
+    original_level = alert.get('alert_level', 'info')
+    trigger_time_str = alert.get('trigger_time', '')
+    trigger_time = _parse_datetime(trigger_time_str)
+    if not trigger_time:
+        return original_level, False
+
+    cutoff = trigger_time - timedelta(hours=24)
+
+    count = 0
+    for past in history:
+        if past.get('rule_id') != rule_id or past.get('station_id') != station_id:
+            continue
+        past_time = _parse_datetime(past.get('alert_time', ''))
+        if past_time and past_time >= cutoff and past_time < trigger_time:
+            count += 1
+
+    if count > 3:
+        try:
+            current_idx = ALERT_LEVEL_ORDER.index(original_level)
+        except ValueError:
+            current_idx = 0
+        if current_idx < len(ALERT_LEVEL_ORDER) - 1:
+            upgraded_level = ALERT_LEVEL_ORDER[current_idx + 1]
+            return upgraded_level, True
+
+    return original_level, False
+
+
 def run_alert_engine(station_id: str, start_time: datetime, end_time: datetime) -> List[Dict]:
     rules = load_alert_rules()
+    history = load_alert_history()
     triggered_alerts = []
+
     for rule in rules:
         result = evaluate_alert_rule(rule, station_id, start_time, end_time)
         if result:
             triggered_alerts.append(result)
-    if triggered_alerts:
-        history = load_alert_history()
-        for alert in triggered_alerts:
+
+    if not triggered_alerts:
+        return []
+
+    resolved_alerts = _resolve_priority_conflicts(triggered_alerts)
+
+    final_alerts = []
+    for alert in resolved_alerts:
+        if not _check_silent_period(alert, history):
+            continue
+        final_alerts.append(alert)
+
+    if final_alerts:
+        for alert in final_alerts:
+            final_level, upgraded = _check_and_apply_upgrade(alert, history)
+            original_level = alert.get('alert_level', 'info')
+
             alert_record = {
                 'alert_id': f"ALERT-{uuid.uuid4().hex[:8].upper()}",
                 'alert_time': alert['trigger_time'],
@@ -379,7 +737,9 @@ def run_alert_engine(station_id: str, start_time: datetime, end_time: datetime) 
                 'station_id': alert['station_id'],
                 'measured_value': alert['measured_value'],
                 'threshold': alert['threshold'],
-                'alert_level': alert['alert_level'],
+                'alert_level': final_level,
+                'original_level': original_level,
+                'upgraded': upgraded,
                 'metric_type': alert['metric_type'],
                 'window_start': alert['window_start'],
                 'window_end': alert['window_end'],
@@ -388,7 +748,8 @@ def run_alert_engine(station_id: str, start_time: datetime, end_time: datetime) 
             }
             history.append(alert_record)
         save_alert_history(history)
-    return triggered_alerts
+
+    return final_alerts
 
 
 def run_alert_engine_all_stations(station_ids: List[str], start_time: datetime, end_time: datetime) -> List[Dict]:
@@ -404,20 +765,20 @@ def get_alert_statistics() -> Dict:
     now = datetime.now()
     today_start = datetime(now.year, now.month, now.day)
     week_start = today_start - timedelta(days=now.weekday())
-    
+
     def _safe_parse(s):
         dt = _parse_datetime(s)
         return dt if dt else datetime.min
-    
+
     today_alerts = [a for a in history if _safe_parse(a.get('alert_time', '')) >= today_start]
     week_alerts = [a for a in history if _safe_parse(a.get('alert_time', '')) >= week_start]
-    
+
     level_counts = {'info': 0, 'warning': 0, 'critical': 0}
     for a in history:
         level = a.get('alert_level', 'info')
         if level in level_counts:
             level_counts[level] += 1
-    
+
     daily_counts = {}
     for a in history:
         try:
@@ -427,26 +788,29 @@ def get_alert_statistics() -> Dict:
                 daily_counts[date_key] = daily_counts.get(date_key, 0) + 1
         except Exception:
             pass
-    
+
     last_7_days = []
     for i in range(6, -1, -1):
         day = now - timedelta(days=i)
         date_key = day.strftime('%Y-%m-%d')
         last_7_days.append({'date': date_key, 'count': daily_counts.get(date_key, 0)})
-    
+
     station_counts = {}
     for a in history:
         sid = a.get('station_id', 'unknown')
         station_counts[sid] = station_counts.get(sid, 0) + 1
     top_stations = sorted(station_counts.items(), key=lambda x: x[1], reverse=True)[:3]
-    
+
+    upgraded_count = sum(1 for a in history if a.get('upgraded', False))
+
     return {
         'today_count': len(today_alerts),
         'week_count': len(week_alerts),
         'total_count': len(history),
         'level_counts': level_counts,
         'daily_trend': last_7_days,
-        'top_stations': top_stations
+        'top_stations': top_stations,
+        'upgraded_count': upgraded_count
     }
 
 
@@ -475,3 +839,8 @@ def filter_alerts_by_date(alerts: List[Dict], start_date, end_date) -> List[Dict
         if alert_dt and start_dt <= alert_dt <= end_dt:
             result.append(a)
     return result
+
+
+def export_rules_to_json() -> str:
+    rules = load_alert_rules()
+    return json.dumps(rules, ensure_ascii=False, indent=2)
