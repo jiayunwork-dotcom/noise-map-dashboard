@@ -383,7 +383,7 @@ def generate_compliance_table(compliance_df: pd.DataFrame, styles: Dict) -> Tabl
         t = Table(data, colWidths=[160 * mm])
         return t
     
-    headers = [styles['table_header'](col) for col in compliance_df.columns]
+    headers = [Paragraph(col, styles['table_header']) for col in compliance_df.columns]
     
     table_data = [headers]
     for _, row in compliance_df.iterrows():
@@ -655,7 +655,7 @@ def generate_comparison_report_pdf(
     elements.append(Paragraph('二、对比数据表格', styles['h2']))
     
     table_headers = ['组ID', '参与站点数', '持续时长(min)', '平均峰值Leq(dB)', '频谱相似度', '定位不确定度(m)', '综合评分']
-    table_data = [[styles['table_header'](h) for h in table_headers]]
+    table_data = [[Paragraph(h, styles['table_header']) for h in table_headers]]
     
     for d in comparison_data:
         row = [
