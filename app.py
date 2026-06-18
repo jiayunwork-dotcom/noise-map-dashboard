@@ -98,7 +98,11 @@ def init_session_state():
         'alert_selected_station': '全部',
         'alert_date_range': None,
         'alert_expanded_row': None,
-        'alert_subtab': 'rules'
+        'alert_subtab': 'rules',
+        'alert_coop_cache': {},
+        'alert_rule_form_key': 0,
+        'alert_date_range_initialized': False,
+        'alert_default_date_range': None
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -1813,20 +1817,24 @@ def _render_alert_rules_panel():
                 format_func=lambda x: METRIC_NAMES.get(x, x),
                 index=['leq_mean', 'leq_peak', 'event_frequency'].index(
                     editing_rule.get('metric_type', 'leq_mean')
-                ) if editing_rule else 0
+                ) if editing_rule else 0,
+                key="alert_form_metric_type"
             )
             
             compare_options = ['greater_than', 'greater_equal']
             if metric_type != 'event_frequency':
                 compare_options.append('continuous_minutes')
             
+            prev_compare = editing_rule.get('compare_type', 'greater_than') if editing_rule else 'greater_than'
+            if prev_compare not in compare_options:
+                prev_compare = compare_options[0]
+            
             compare_type = st.selectbox(
                 "比较方式",
                 options=compare_options,
                 format_func=lambda x: COMPARE_NAMES.get(x, x),
-                index=compare_options.index(
-                    editing_rule.get('compare_type', 'greater_than')
-                ) if editing_rule and editing_rule.get('compare_type') in compare_options else 0
+                index=compare_options.index(prev_compare),
+                key=f"alert_form_compare_{metric_type}"
             )
             
             threshold = st.number_input(
@@ -1838,13 +1846,14 @@ def _render_alert_rules_panel():
             )
             
             continuous_minutes = 5
-            if compare_type == 'continuous_minutes':
+            if compare_type == 'continuous_minutes' and metric_type != 'event_frequency':
                 continuous_minutes = st.slider(
                     "连续N分钟",
                     min_value=2,
                     max_value=60,
                     value=int(editing_rule.get('continuous_minutes', 5)) if editing_rule else 5,
-                    step=1
+                    step=1,
+                    key=f"alert_form_continuous_{metric_type}"
                 )
             
             alert_level = st.selectbox(
@@ -2058,23 +2067,26 @@ def _render_alert_history_panel():
         st.session_state.alert_selected_station = selected_station
     
     with col_f3:
-        default_start = datetime.now() - timedelta(days=7)
-        default_end = datetime.now()
-        if history:
-            alert_times = []
-            for a in history:
-                dt = _parse_datetime(a.get('alert_time', ''))
-                if dt:
-                    alert_times.append(dt)
-            if alert_times:
-                min_t = min(alert_times).date()
-                max_t = max(alert_times).date()
-                default_start = datetime.combine(min_t, datetime.min.time())
-                default_end = datetime.combine(max_t, datetime.max.time())
+        if 'alert_date_range_initialized' not in st.session_state or not st.session_state.alert_date_range_initialized:
+            default_start = datetime.now() - timedelta(days=7)
+            default_end = datetime.now()
+            if history:
+                alert_times = []
+                for a in history:
+                    dt = _parse_datetime(a.get('alert_time', ''))
+                    if dt:
+                        alert_times.append(dt)
+                if alert_times:
+                    min_t = min(alert_times).date()
+                    max_t = max(alert_times).date()
+                    default_start = min_t
+                    default_end = max_t
+            st.session_state.alert_default_date_range = (default_start, default_end)
+            st.session_state.alert_date_range_initialized = True
         
         date_range = st.date_input(
             "时间范围",
-            value=(default_start, default_end),
+            value=st.session_state.alert_default_date_range,
             key="alert_date_range_input"
         )
     
@@ -2208,6 +2220,14 @@ def _auto_run_coop_for_alert(alert: Dict) -> Optional[Dict]:
         return None
     
     station_id = alert.get('station_id')
+    cache_key = f"{station_id}_{alert_time.strftime('%Y%m%d')}"
+    
+    if 'alert_coop_cache' not in st.session_state:
+        st.session_state.alert_coop_cache = {}
+    
+    if cache_key in st.session_state.alert_coop_cache:
+        return _get_coop_event_info_for_alert(alert)
+    
     stations_df = get_all_stations()
     if stations_df.empty:
         return None
@@ -2234,33 +2254,48 @@ def _auto_run_coop_for_alert(alert: Dict) -> Optional[Dict]:
         selected_ids = stations_df['station_id'].tolist()[:min(8, len(stations_df))]
     
     if len(selected_ids) < 3:
+        st.session_state.alert_coop_cache[cache_key] = False
         return None
     
     try:
-        dist_matrix, delay_matrix, ordered_ids = compute_station_distance_matrix(
-            stations_df[stations_df['station_id'].isin(selected_ids)].drop_duplicates('station_id')
-        )
-        if len(ordered_ids) < 3:
-            return None
-        
-        all_events = detect_events_for_stations(ordered_ids, threshold_db=5.0)
-        cooperative_groups = match_cooperative_events(
-            all_events, dist_matrix, ordered_ids,
-            spectrum_threshold=0.5, time_tolerance=5.0
-        )
-        location_results = {}
-        for group in cooperative_groups:
-            selected_stations_subset = stations_df[
-                stations_df['station_id'].isin(group['participating_stations'])
-            ].drop_duplicates('station_id')
-            loc = estimate_source_location(group, selected_stations_subset)
-            location_results[group['group_id']] = loc
-        
-        st.session_state.coop_result = cooperative_groups
-        st.session_state.coop_locations = location_results
+        with st.spinner('正在关联协同溯源分析，请稍候...'):
+            dist_matrix, delay_matrix, ordered_ids = compute_station_distance_matrix(
+                stations_df[stations_df['station_id'].isin(selected_ids)].drop_duplicates('station_id')
+            )
+            if len(ordered_ids) < 3:
+                st.session_state.alert_coop_cache[cache_key] = False
+                return None
+            
+            all_events = detect_events_for_stations(ordered_ids, threshold_db=5.0)
+            cooperative_groups = match_cooperative_events(
+                all_events, dist_matrix, ordered_ids,
+                spectrum_threshold=0.5, time_tolerance=5.0
+            )
+            location_results = {}
+            for group in cooperative_groups:
+                selected_stations_subset = stations_df[
+                    stations_df['station_id'].isin(group['participating_stations'])
+                ].drop_duplicates('station_id')
+                loc = estimate_source_location(group, selected_stations_subset)
+                location_results[group['group_id']] = loc
+            
+            existing_coop = st.session_state.get('coop_result', []) or []
+            existing_loc = st.session_state.get('coop_locations', {}) or {}
+            
+            existing_ids = {g['group_id'] for g in existing_coop}
+            for g in cooperative_groups:
+                if g['group_id'] not in existing_ids:
+                    existing_coop.append(g)
+            
+            existing_loc.update(location_results)
+            
+            st.session_state.coop_result = existing_coop
+            st.session_state.coop_locations = existing_loc
+            st.session_state.alert_coop_cache[cache_key] = True
         
         return _get_coop_event_info_for_alert(alert)
     except Exception as e:
+        st.session_state.alert_coop_cache[cache_key] = False
         return None
 
 

@@ -188,58 +188,92 @@ def _check_continuous_minutes(df: pd.DataFrame, threshold: float, n_minutes: int
         return False, None
     df_sorted = df.sort_values('measurement_time').copy()
     df_sorted = df_sorted.reset_index(drop=True)
-    if len(df_sorted) < 2:
+    if len(df_sorted) < 1:
         return False, None
+    
     times = df_sorted['measurement_time'].values
     leq_vals = df_sorted['leq'].values
-    n_minutes_delta = timedelta(minutes=n_minutes)
-    valid_indices = []
-    for i in range(len(leq_vals)):
-        if not np.isnan(leq_vals[i]) and leq_vals[i] > threshold:
-            valid_indices.append(i)
-    if len(valid_indices) == 0:
+    
+    py_times = []
+    for t in times:
+        pt = pd.Timestamp(t)
+        if isinstance(pt, pd.Timestamp):
+            pt = pt.to_pydatetime()
+        py_times.append(pt)
+    
+    raw_sample_interval_sec = None
+    if len(py_times) >= 3:
+        intervals = []
+        for i in range(1, len(py_times)):
+            diff = (py_times[i] - py_times[i-1]).total_seconds()
+            if diff > 0:
+                intervals.append(diff)
+        if intervals:
+            raw_sample_interval_sec = float(np.median(intervals))
+    elif len(py_times) == 2:
+        diff = (py_times[1] - py_times[0]).total_seconds()
+        if diff > 0:
+            raw_sample_interval_sec = diff
+    
+    n_seconds_target = n_minutes * 60.0
+    
+    if raw_sample_interval_sec is not None and raw_sample_interval_sec >= n_seconds_target:
         return False, None
-    window_start_idx = None
-    for i in range(len(valid_indices)):
-        start_i = valid_indices[i]
-        start_time = pd.Timestamp(times[start_i])
-        if isinstance(start_time, pd.Timestamp):
-            start_time = start_time.to_pydatetime()
-        end_time_target = start_time + n_minutes_delta
-        max_time_in_window = start_time
-        has_gap = False
-        for j in range(i, len(valid_indices)):
-            cur_i = valid_indices[j]
-            cur_time = pd.Timestamp(times[cur_i])
-            if isinstance(cur_time, pd.Timestamp):
-                cur_time = cur_time.to_pydatetime()
-            if cur_time > end_time_target:
-                break
-            if j > i:
-                prev_i = valid_indices[j - 1]
-                prev_time = pd.Timestamp(times[prev_i])
-                if isinstance(prev_time, pd.Timestamp):
-                    prev_time = prev_time.to_pydatetime()
-                gap = (cur_time - prev_time).total_seconds()
-                max_gap_allowed = max(300, n_minutes * 60 / 5)
-                if gap > max_gap_allowed:
-                    has_gap = True
-                    break
-            max_time_in_window = cur_time
-        if not has_gap and (max_time_in_window - start_time) >= n_minutes_delta * 0.9:
-            return True, start_time
-        if len(valid_indices) >= 2:
-            first_time = pd.Timestamp(times[valid_indices[0]])
-            if isinstance(first_time, pd.Timestamp):
-                first_time = first_time.to_pydatetime()
-            last_time = pd.Timestamp(times[valid_indices[-1]])
-            if isinstance(last_time, pd.Timestamp):
-                last_time = last_time.to_pydatetime()
-            total_span = (last_time - first_time).total_seconds() / 60.0
-            required_count = max(2, n_minutes // 60)
-            if n_minutes <= 60 and len(valid_indices) >= 1 and total_span >= 0:
-                if len(valid_indices) >= required_count:
-                    return True, first_time
+    
+    sample_interval_sec = raw_sample_interval_sec if raw_sample_interval_sec is not None else 3600.0
+    
+    REASONABLE_MAX_INTERVAL_SEC = 30 * 60.0
+    capped_sample_interval = min(sample_interval_sec, REASONABLE_MAX_INTERVAL_SEC)
+    
+    if capped_sample_interval > n_seconds_target * 0.5:
+        min_points_needed = int(np.ceil(n_seconds_target / capped_sample_interval)) + 1
+    else:
+        min_points_needed = 2
+    
+    max_gap_sec = min(
+        max(capped_sample_interval * 2.0, capped_sample_interval + 5 * 60.0),
+        max(n_seconds_target * 0.3, 10 * 60.0)
+    )
+    
+    valid_data = []
+    for i in range(len(py_times)):
+        if not np.isnan(leq_vals[i]) and leq_vals[i] > threshold:
+            valid_data.append((py_times[i], float(leq_vals[i])))
+    
+    if not valid_data:
+        return False, None
+    
+    segments = []
+    current_segment = [valid_data[0]]
+    for i in range(1, len(valid_data)):
+        gap = (valid_data[i][0] - valid_data[i-1][0]).total_seconds()
+        if gap <= max_gap_sec:
+            current_segment.append(valid_data[i])
+        else:
+            segments.append(current_segment)
+            current_segment = [valid_data[i]]
+    if current_segment:
+        segments.append(current_segment)
+    
+    best_segment = None
+    best_duration = 0.0
+    
+    for seg in segments:
+        if len(seg) < min_points_needed:
+            continue
+        if len(seg) == 1:
+            seg_duration = capped_sample_interval
+        else:
+            seg_duration = (seg[-1][0] - seg[0][0]).total_seconds() + capped_sample_interval
+        
+        if seg_duration >= n_seconds_target * 0.9:
+            if seg_duration > best_duration:
+                best_duration = seg_duration
+                best_segment = seg
+    
+    if best_segment is not None:
+        return True, best_segment[0][0]
+    
     return False, None
 
 
