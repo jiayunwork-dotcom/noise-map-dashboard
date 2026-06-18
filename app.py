@@ -40,6 +40,13 @@ from correlation_analysis import (
     match_cooperative_events, estimate_source_location,
     export_traceability_geojson, haversine_distance, SOUND_SPEED
 )
+from alert_manager import (
+    load_alert_rules, save_alert_rules, add_alert_rule, delete_alert_rule,
+    load_alert_history, save_alert_history, run_alert_engine_all_stations,
+    get_alert_statistics, get_alerts_by_station, has_active_alerts,
+    evaluate_alert_rule, ALERT_LEVELS, METRIC_NAMES, COMPARE_NAMES,
+    _count_noise_events
+)
 
 st.set_page_config(
     page_title="城市噪声地图分析系统",
@@ -85,7 +92,13 @@ def init_session_state():
         'coop_compare_groups': [],
         'coop_selected_group': None,
         'coop_pdf_data': None,
-        'coop_pdf_error': None
+        'coop_pdf_error': None,
+        'alert_editing_rule': None,
+        'alert_selected_level': '全部',
+        'alert_selected_station': '全部',
+        'alert_date_range': None,
+        'alert_expanded_row': None,
+        'alert_subtab': 'rules'
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -111,6 +124,7 @@ def main():
             "🔊 声源识别",
             "🛣️ 噪声预测",
             "🎯 协同溯源",
+            "🔔 告警管理",
             "📄 统计报告"
         ]
     )
@@ -134,6 +148,8 @@ def main():
         page_noise_prediction()
     elif page.startswith("🎯"):
         page_cooperative_tracing()
+    elif page.startswith("🔔"):
+        page_alert_management()
     elif page.startswith("📄"):
         page_report()
 
@@ -1739,6 +1755,471 @@ def page_noise_prediction():
         st.info("暂无历史预测记录")
 
 
+def page_alert_management():
+    st.header("🔔 噪声事件告警与阈值管理")
+    
+    alert_tab_rules, alert_tab_history = st.tabs(["📋 告警规则配置", "📊 告警历史与统计"])
+    
+    with alert_tab_rules:
+        _render_alert_rules_panel()
+    
+    with alert_tab_history:
+        _render_alert_history_panel()
+
+
+def _render_alert_rules_panel():
+    st.subheader("告警规则配置")
+    
+    stations_df = get_all_stations()
+    rules = load_alert_rules()
+    
+    col_form, col_list = st.columns([1, 1.5])
+    
+    with col_form:
+        st.markdown("#### ✏️ 新建/编辑规则")
+        
+        editing_rule = st.session_state.alert_editing_rule
+        
+        with st.form("alert_rule_form"):
+            rule_name = st.text_input(
+                "规则名称",
+                value=editing_rule.get('rule_name', '') if editing_rule else '',
+                placeholder="请输入规则名称"
+            )
+            
+            monitor_target = st.radio(
+                "监控对象",
+                options=['all', 'single'],
+                format_func=lambda x: '全部站点' if x == 'all' else '单个站点',
+                index=0 if (not editing_rule or editing_rule.get('monitor_target') == 'all') else 1,
+                horizontal=True
+            )
+            
+            station_id = None
+            if monitor_target == 'single':
+                station_options = [(row['station_id'], f"{row.get('station_name', row['station_id'])} ({row['station_id']})") 
+                                   for _, row in stations_df.iterrows()]
+                default_station = editing_rule.get('station_id') if editing_rule else (station_options[0][0] if station_options else None)
+                station_id = st.selectbox(
+                    "选择站点",
+                    options=[s[0] for s in station_options],
+                    format_func=lambda x: next((lbl for sid, lbl in station_options if sid == x), x),
+                    index=0
+                )
+            
+            metric_type = st.selectbox(
+                "触发指标",
+                options=['leq_mean', 'leq_peak', 'event_frequency'],
+                format_func=lambda x: METRIC_NAMES.get(x, x),
+                index=['leq_mean', 'leq_peak', 'event_frequency'].index(
+                    editing_rule.get('metric_type', 'leq_mean')
+                ) if editing_rule else 0
+            )
+            
+            compare_options = ['greater_than', 'greater_equal']
+            if metric_type != 'event_frequency':
+                compare_options.append('continuous_minutes')
+            
+            compare_type = st.selectbox(
+                "比较方式",
+                options=compare_options,
+                format_func=lambda x: COMPARE_NAMES.get(x, x),
+                index=compare_options.index(
+                    editing_rule.get('compare_type', 'greater_than')
+                ) if editing_rule and editing_rule.get('compare_type') in compare_options else 0
+            )
+            
+            threshold = st.number_input(
+                "阈值数值",
+                value=float(editing_rule.get('threshold', 60.0)) if editing_rule else 60.0,
+                min_value=0.0,
+                step=0.5,
+                help="Leq单位为dB，事件频次单位为次"
+            )
+            
+            continuous_minutes = 5
+            if compare_type == 'continuous_minutes':
+                continuous_minutes = st.slider(
+                    "连续N分钟",
+                    min_value=2,
+                    max_value=60,
+                    value=int(editing_rule.get('continuous_minutes', 5)) if editing_rule else 5,
+                    step=1
+                )
+            
+            alert_level = st.selectbox(
+                "告警等级",
+                options=['info', 'warning', 'critical'],
+                format_func=lambda x: ALERT_LEVELS.get(x, {}).get('name', x),
+                index=['info', 'warning', 'critical'].index(
+                    editing_rule.get('alert_level', 'warning')
+                ) if editing_rule else 1
+            )
+            
+            time_period = st.radio(
+                "生效时段",
+                options=['all_day', 'custom'],
+                format_func=lambda x: '全天' if x == 'all_day' else '自定义时段',
+                index=0 if (not editing_rule or editing_rule.get('time_period') == 'all_day') else 1,
+                horizontal=True
+            )
+            
+            start_time = "08:00"
+            end_time = "20:00"
+            if time_period == 'custom':
+                col_st, col_et = st.columns(2)
+                with col_st:
+                    start_time = st.text_input(
+                        "开始时间",
+                        value=editing_rule.get('start_time', '08:00') if editing_rule else '08:00',
+                        placeholder="HH:MM"
+                    )
+                with col_et:
+                    end_time = st.text_input(
+                        "结束时间",
+                        value=editing_rule.get('end_time', '20:00') if editing_rule else '20:00',
+                        placeholder="HH:MM"
+                    )
+            
+            enabled = st.toggle(
+                "启用规则",
+                value=editing_rule.get('enabled', True) if editing_rule else True
+            )
+            
+            col_submit, col_cancel = st.columns(2)
+            with col_submit:
+                submit_label = "保存修改" if editing_rule else "➕ 新建规则"
+                submitted = st.form_submit_button(submit_label, type="primary", use_container_width=True)
+            with col_cancel:
+                if editing_rule:
+                    cancel = st.form_submit_button("取消编辑", use_container_width=True)
+                    if cancel:
+                        st.session_state.alert_editing_rule = None
+                        st.rerun()
+            
+            if submitted:
+                rule_data = {
+                    'rule_name': rule_name,
+                    'monitor_target': monitor_target,
+                    'station_id': station_id,
+                    'metric_type': metric_type,
+                    'compare_type': compare_type,
+                    'threshold': threshold,
+                    'continuous_minutes': continuous_minutes,
+                    'alert_level': alert_level,
+                    'time_period': time_period,
+                    'start_time': start_time,
+                    'end_time': end_time,
+                    'enabled': enabled
+                }
+                if editing_rule:
+                    rule_data['rule_id'] = editing_rule['rule_id']
+                
+                if not rule_name.strip():
+                    st.error("请输入规则名称")
+                else:
+                    result = add_alert_rule(rule_data)
+                    if result:
+                        st.success(f"规则已保存: {result['rule_name']}")
+                        st.session_state.alert_editing_rule = None
+                        st.rerun()
+                    else:
+                        st.error("保存规则失败")
+    
+    with col_list:
+        st.markdown(f"#### 📋 规则列表 ({len(rules)}条)")
+        
+        if not rules:
+            st.info("暂无告警规则，请在左侧创建")
+        else:
+            for i, rule in enumerate(rules):
+                level_info = ALERT_LEVELS.get(rule.get('alert_level', 'info'), {})
+                status_icon = "✅" if rule.get('enabled', True) else "⏸️"
+                target_text = "全部站点" if rule.get('monitor_target') == 'all' else f"站点: {rule.get('station_id', '-')}"
+                
+                with st.expander(
+                    f"{status_icon} **{rule['rule_name']}** - {level_info.get('name', '')}",
+                    expanded=False
+                ):
+                    col_info, col_actions = st.columns([3, 1])
+                    
+                    with col_info:
+                        st.markdown(f"**监控对象**: {target_text}")
+                        st.markdown(f"**触发指标**: {METRIC_NAMES.get(rule.get('metric_type'), '-')}")
+                        st.markdown(f"**比较方式**: {COMPARE_NAMES.get(rule.get('compare_type'), '-')}")
+                        threshold_text = f"{rule.get('threshold', 0)}"
+                        if rule.get('compare_type') == 'continuous_minutes':
+                            threshold_text += f" (连续{rule.get('continuous_minutes', 5)}分钟)"
+                        st.markdown(f"**阈值**: {threshold_text}")
+                        period_text = "全天" if rule.get('time_period') == 'all_day' else f"{rule.get('start_time', '')} - {rule.get('end_time', '')}"
+                        st.markdown(f"**生效时段**: {period_text}")
+                        st.markdown(f"**告警等级**: :{level_info.get('color', '#666')}[{level_info.get('name', '')}]")
+                    
+                    with col_actions:
+                        if st.button("✏️ 编辑", key=f"edit_rule_{rule['rule_id']}", use_container_width=True):
+                            st.session_state.alert_editing_rule = rule
+                            st.rerun()
+                        
+                        if st.button("🗑️ 删除", key=f"del_rule_{rule['rule_id']}", use_container_width=True):
+                            if delete_alert_rule(rule['rule_id']):
+                                st.success("规则已删除")
+                                st.rerun()
+                            else:
+                                st.error("删除失败")
+
+
+def _render_alert_history_panel():
+    st.subheader("告警历史记录")
+    
+    history = load_alert_history()
+    stations_df = get_all_stations()
+    stats = get_alert_statistics()
+    
+    st.markdown("### 📈 统计概览")
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("今日告警数", stats['today_count'])
+    with col2:
+        st.metric("本周告警数", stats['week_count'])
+    with col3:
+        st.metric("历史总告警", stats['total_count'])
+    
+    col_pie, col_trend, col_top = st.columns([1, 1.5, 1])
+    
+    with col_pie:
+        st.markdown("**各等级占比**")
+        level_counts = stats['level_counts']
+        fig_pie, ax_pie = plt.subplots(figsize=(4, 3))
+        labels = [ALERT_LEVELS[k]['name'] for k in ['critical', 'warning', 'info'] if level_counts.get(k, 0) > 0]
+        sizes = [level_counts.get(k, 0) for k in ['critical', 'warning', 'info'] if level_counts.get(k, 0) > 0]
+        colors = [ALERT_LEVELS[k]['color'] for k in ['critical', 'warning', 'info'] if level_counts.get(k, 0) > 0]
+        if sizes and sum(sizes) > 0:
+            ax_pie.pie(sizes, labels=labels, colors=colors, autopct='%1.0f%%', startangle=90)
+            ax_pie.set_aspect('equal')
+        else:
+            ax_pie.text(0.5, 0.5, '暂无数据', ha='center', va='center', transform=ax_pie.transAxes)
+            ax_pie.axis('off')
+        st.pyplot(fig_pie)
+        plt.close(fig_pie)
+    
+    with col_trend:
+        st.markdown("**最近7天告警趋势**")
+        daily_data = stats['daily_trend']
+        fig_trend, ax_trend = plt.subplots(figsize=(6, 3))
+        dates = [d['date'][5:] for d in daily_data]
+        counts = [d['count'] for d in daily_data]
+        ax_trend.plot(dates, counts, marker='o', linewidth=2, color='#2196F3')
+        ax_trend.fill_between(dates, counts, alpha=0.2, color='#2196F3')
+        ax_trend.set_ylabel('告警数')
+        ax_trend.grid(True, alpha=0.3)
+        for spine in ax_trend.spines.values():
+            spine.set_visible(False)
+        st.pyplot(fig_trend)
+        plt.close(fig_trend)
+    
+    with col_top:
+        st.markdown("**告警最频繁Top3站点**")
+        top_stations = stats['top_stations']
+        if top_stations:
+            for idx, (sid, count) in enumerate(top_stations):
+                station_name = sid
+                if not stations_df.empty:
+                    row = stations_df[stations_df['station_id'] == sid]
+                    if not row.empty:
+                        station_name = row.iloc[0].get('station_name', sid)
+                medal = ["🥇", "🥈", "🥉"][idx] if idx < 3 else "  "
+                st.markdown(f"{medal} **{station_name}**: {count}次")
+        else:
+            st.info("暂无数据")
+    
+    st.markdown("---")
+    st.markdown("### 🔍 筛选条件")
+    
+    col_f1, col_f2, col_f3 = st.columns(3)
+    with col_f1:
+        level_options = ['全部', '严重', '警告', '提示']
+        level_map = {'全部': 'all', '严重': 'critical', '警告': 'warning', '提示': 'info'}
+        selected_level_label = st.selectbox(
+            "告警等级",
+            options=level_options,
+            index=level_options.index(st.session_state.alert_selected_level)
+        )
+        st.session_state.alert_selected_level = selected_level_label
+        selected_level = level_map[selected_level_label]
+    
+    with col_f2:
+        station_options = ['全部'] + stations_df['station_id'].tolist() if not stations_df.empty else ['全部']
+        selected_station = st.selectbox(
+            "选择站点",
+            options=station_options,
+            index=station_options.index(st.session_state.alert_selected_station) if st.session_state.alert_selected_station in station_options else 0
+        )
+        st.session_state.alert_selected_station = selected_station
+    
+    with col_f3:
+        date_range = st.date_input(
+            "时间范围",
+            value=(datetime.now() - timedelta(days=7), datetime.now()),
+            key="alert_date_range_input"
+        )
+    
+    filtered_history = history.copy()
+    
+    if selected_level != 'all':
+        filtered_history = [a for a in filtered_history if a.get('alert_level') == selected_level]
+    
+    if selected_station != '全部':
+        filtered_history = [a for a in filtered_history if a.get('station_id') == selected_station]
+    
+    if date_range and len(date_range) == 2:
+        start_date, end_date = date_range
+        start_dt = datetime.combine(start_date, datetime.min.time())
+        end_dt = datetime.combine(end_date, datetime.max.time())
+        filtered_history = [
+            a for a in filtered_history
+            if start_dt <= datetime.fromisoformat(a['alert_time'].replace('Z', '+00:00').replace('+00:00', '')) <= end_dt
+        ]
+    
+    filtered_history.sort(key=lambda x: x['alert_time'], reverse=True)
+    
+    st.markdown(f"#### 📋 告警记录 ({len(filtered_history)}条)")
+    
+    if not filtered_history:
+        st.info("暂无告警记录")
+    else:
+        for alert in filtered_history:
+            level_info = ALERT_LEVELS.get(alert.get('alert_level', 'info'), {})
+            bg_color = level_info.get('bg_color', '#fff')
+            text_color = level_info.get('color', '#333')
+            
+            is_expanded = st.session_state.alert_expanded_row == alert['alert_id']
+            
+            with st.container():
+                st.markdown(
+                    f"""
+                    <div style="background-color: {bg_color}; padding: 12px; border-radius: 8px; margin-bottom: 4px;">
+                        <div style="display: flex; justify-content: space-between; align-items: center;">
+                            <div>
+                                <span style="font-weight: bold; color: {text_color};">
+                                    [{level_info.get('name', '')}] {alert['rule_name']}
+                                </span>
+                                <span style="margin-left: 12px; color: #666;">
+                                    站点: {alert['station_id']}
+                                </span>
+                            </div>
+                            <div style="color: #666; font-size: 0.9em;">
+                                {alert['alert_time']}
+                            </div>
+                        </div>
+                        <div style="margin-top: 6px; color: #555;">
+                            实测值: <strong>{alert['measured_value']}</strong> / 阈值: {alert['threshold']}
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+                
+                if st.button("📊 查看详情", key=f"detail_{alert['alert_id']}"):
+                    if is_expanded:
+                        st.session_state.alert_expanded_row = None
+                    else:
+                        st.session_state.alert_expanded_row = alert['alert_id']
+                    st.rerun()
+                
+                if is_expanded:
+                    st.markdown("##### 📈 触发时刻前后5分钟Leq曲线")
+                    
+                    try:
+                        alert_time = datetime.fromisoformat(alert['alert_time'].replace('Z', '+00:00').replace('+00:00', ''))
+                    except Exception:
+                        alert_time = datetime.now()
+                    
+                    window_start = alert_time - timedelta(minutes=5)
+                    window_end = alert_time + timedelta(minutes=5)
+                    
+                    detail_df = get_station_measurements(
+                        alert['station_id'],
+                        window_start.strftime('%Y-%m-%d %H:%M:%S'),
+                        window_end.strftime('%Y-%m-%d %H:%M:%S')
+                    )
+                    
+                    if not detail_df.empty:
+                        fig_detail, ax_detail = plt.subplots(figsize=(10, 3))
+                        times = detail_df['measurement_time']
+                        leq_vals = detail_df['leq']
+                        ax_detail.plot(times, leq_vals, 'b-', linewidth=1.5, label='Leq')
+                        ax_detail.axhline(y=alert['threshold'], color='red', linestyle='--', 
+                                         label=f'阈值 ({alert["threshold"]} dB)', alpha=0.7)
+                        ax_detail.axvline(x=alert_time, color='orange', linestyle=':', 
+                                         label='告警触发时刻', alpha=0.7)
+                        ax_detail.set_ylabel('Leq (dB)')
+                        ax_detail.set_title(f"站点 {alert['station_id']} - 告警触发前后")
+                        ax_detail.legend(loc='best')
+                        ax_detail.grid(True, alpha=0.3)
+                        plt.xticks(rotation=45)
+                        plt.tight_layout()
+                        st.pyplot(fig_detail)
+                        plt.close(fig_detail)
+                    else:
+                        st.info("该时段暂无监测数据")
+                    
+                    coop_info = _get_coop_event_info_for_alert(alert)
+                    if coop_info:
+                        st.markdown("##### 🔗 协同溯源关联")
+                        st.info(
+                            f"该站点属于协同事件组 **{coop_info['group_id']}**\n\n"
+                            f"- 参与站点数: {coop_info['station_count']}个\n"
+                            f"- 定位状态: {coop_info['location_status']}"
+                        )
+                    
+                    st.markdown("---")
+
+
+def _get_coop_event_info_for_alert(alert: Dict) -> Optional[Dict]:
+    coop_result = st.session_state.get('coop_result')
+    if not coop_result:
+        return None
+    
+    station_id = alert.get('station_id')
+    alert_time_str = alert.get('alert_time')
+    try:
+        alert_time = datetime.fromisoformat(alert_time_str.replace('Z', '+00:00').replace('+00:00', ''))
+    except Exception:
+        return None
+    
+    for group in coop_result:
+        participating_stations = group.get('participating_stations', [])
+        if station_id in participating_stations:
+            group_start = group.get('earliest_time')
+            group_end = group.get('latest_time')
+            if isinstance(group_start, pd.Timestamp):
+                group_start = group_start.to_pydatetime()
+            if isinstance(group_end, pd.Timestamp):
+                group_end = group_end.to_pydatetime()
+            
+            try:
+                if group_start - timedelta(hours=1) <= alert_time <= group_end + timedelta(hours=1):
+                    location_status = "未定位"
+                    locations = st.session_state.get('coop_locations')
+                    if locations and group.get('group_id') in locations:
+                        loc = locations[group['group_id']]
+                        if loc.get('located'):
+                            location_status = "已定位"
+                        elif loc.get('method'):
+                            location_status = f"部分定位({loc.get('method', '')})"
+                    
+                    return {
+                        'group_id': group['group_id'],
+                        'station_count': len(participating_stations),
+                        'location_status': location_status
+                    }
+            except Exception:
+                pass
+    
+    return None
+
+
 def page_report():
     st.header("📄 统计报告生成")
     
@@ -2060,6 +2541,8 @@ def page_cooperative_tracing():
     
     if 'coop_selected_group' not in st.session_state:
         st.session_state.coop_selected_group = None
+    
+    groups_sorted = sorted(cooperative_groups, key=lambda g: g['earliest_time'])
     
     tab_map, tab_timeline, tab_table, tab_export = st.tabs([
         "🗺️ 溯源地图", "⏱️ 事件时间轴", "📋 统计表格", "📤 导出GeoJSON"
@@ -2756,8 +3239,16 @@ def page_cooperative_tracing():
             gid = group['group_id']
             loc = location_results.get(gid, {})
             num_stations = len(group['participating_stations'])
+            
+            has_alert = False
+            for sid in group['participating_stations']:
+                if has_active_alerts(sid, lookback_hours=24):
+                    has_alert = True
+                    break
+            alert_tag = " 🔔 有活跃告警" if has_alert else ""
+            
             table_rows.append({
-                '组ID': gid,
+                '组ID': gid + alert_tag,
                 '站点数': num_stations,
                 '定位类型': '精确定位' if num_stations >= 3 else '仅双曲线',
                 '最早触发站': group['earliest_station'],
